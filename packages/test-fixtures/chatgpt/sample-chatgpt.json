@@ -1,0 +1,26 @@
+[
+  {
+    "id": "chatgpt-1",
+    "title": "测试 ChatGPT 会话",
+    "create_time": 1739251200,
+    "update_time": 1739252200,
+    "mapping": {
+      "1": {
+        "id": "1",
+        "message": {
+          "author": { "role": "user" },
+          "create_time": 1739251200,
+          "content": { "parts": ["你好，请解释 RAG"] }
+        }
+      },
+      "2": {
+        "id": "2",
+        "message": {
+          "author": { "role": "assistant" },
+          "create_time": 1739251210,
+          "content": { "parts": ["RAG 是检索增强生成。"] }
+        }
+      }
+    }
+  }
+]

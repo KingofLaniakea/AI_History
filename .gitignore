@@ -1,0 +1,12 @@
+node_modules
+.DS_Store
+.vscode
+*.log
+coverage
+playwright-report
+test-results
+apps/desktop/dist
+apps/desktop/src-tauri/target
+apps/extension/.output
+apps/extension/dist
+apps/extension/.wxt

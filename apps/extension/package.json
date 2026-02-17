@@ -1,0 +1,17 @@
+{
+  "name": "@ai-history/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "test": "echo \"No extension tests configured yet\"",
+    "lint": "echo \"No lint configured for extension\""
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "wxt": "^0.20.6"
+  }
+}

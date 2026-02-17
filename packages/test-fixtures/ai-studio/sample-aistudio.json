@@ -1,0 +1,12 @@
+{
+  "conversations": [
+    {
+      "id": "studio-1",
+      "name": "测试 AI Studio 会话",
+      "turns": [
+        { "role": "user", "content": "请解释函数式编程" },
+        { "role": "assistant", "content": "函数式编程强调不可变数据与纯函数。" }
+      ]
+    }
+  ]
+}

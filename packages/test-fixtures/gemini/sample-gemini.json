@@ -1,0 +1,12 @@
+{
+  "conversations": [
+    {
+      "id": "gem-1",
+      "title": "测试 Gemini 会话",
+      "messages": [
+        { "role": "user", "content": "请给我一个 JavaScript 例子" },
+        { "role": "assistant", "content": "下面是一个简单例子。", "model": "gemini-1.5-pro" }
+      ]
+    }
+  ]
+}

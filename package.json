@@ -1,0 +1,16 @@
+{
+  "name": "ai-history-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev:desktop": "pnpm --filter @ai-history/desktop dev",
+    "dev:app": "pnpm --filter @ai-history/desktop tauri:dev",
+    "dev:extension": "pnpm --filter @ai-history/extension dev",
+    "check:no-generated-js": "node scripts/check-no-generated-js.mjs",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "test:parsers": "pnpm --filter @ai-history/parsers test",
+    "lint": "pnpm -r lint"
+  }
+}

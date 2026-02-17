@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI History",
+  "version": "0.1.0",
+  "identifier": "com.aihistory.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --filter @ai-history/desktop dev",
+    "beforeBuildCommand": "pnpm --filter @ai-history/desktop build",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AI History",
+        "width": 1320,
+        "height": 900,
+        "minWidth": 860,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "msi"],
+    "icon": ["icons/icon.png"]
+  }
+}

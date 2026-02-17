@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI History Capture</title>
+    <style>
+      :root {
+        --bg: #fffdf9;
+        --border: #ddd6c8;
+        --text: #2f2a21;
+        --muted: #736a5b;
+        --accent: #116a68;
+        --accent-soft: #def2f1;
+      }
+      body {
+        margin: 0;
+        padding: 12px;
+        width: 320px;
+        font-family: "Noto Sans SC", "PingFang SC", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      button,
+      input {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        font: inherit;
+      }
+      button {
+        cursor: pointer;
+        background: white;
+      }
+      button.primary {
+        background: var(--accent-soft);
+        border-color: #8fd3cf;
+      }
+      .muted {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      #status {
+        min-height: 18px;
+        font-size: 12px;
+      }
+      #status.error {
+        color: #a11919;
+      }
+      #status.ok {
+        color: #0a6d3a;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <button id="capture-current" class="primary">抓取当前会话</button>
+      <div class="muted">适用于当前打开的 ChatGPT / Gemini / AI Studio 页面</div>
+      <input id="capture-url" type="url" placeholder="粘贴会话链接 https://..." />
+      <button id="capture-url-btn">打开链接并抓取</button>
+      <div id="status" class="muted"></div>
+    </div>
+    <script type="module">
+      const statusEl = document.getElementById("status");
+      const currentBtn = document.getElementById("capture-current");
+      const urlInput = document.getElementById("capture-url");
+      const captureUrlBtn = document.getElementById("capture-url-btn");
+
+      function setStatus(text, kind = "muted") {
+        statusEl.textContent = text;
+        statusEl.className = kind;
+      }
+
+      currentBtn.addEventListener("click", () => {
+        setStatus("正在抓取当前标签页...");
+        chrome.runtime.sendMessage({ type: "CAPTURE_CURRENT_TAB" }, (response) => {
+          if (!response?.ok) {
+            setStatus(response?.error || "抓取失败", "error");
+            return;
+          }
+
+          setStatus(response.message || "已导入", "ok");
+        });
+      });
+
+      captureUrlBtn.addEventListener("click", () => {
+        const url = urlInput.value.trim();
+        if (!url) {
+          setStatus("请输入链接", "error");
+          return;
+        }
+
+        setStatus("正在打开链接并抓取...");
+        chrome.runtime.sendMessage({ type: "CAPTURE_URL", url }, (response) => {
+          if (!response?.ok) {
+            setStatus(response?.error || "抓取失败", "error");
+            return;
+          }
+
+          setStatus(response.message || "已导入", "ok");
+        });
+      });
+    </script>
+  </body>
+</html>
