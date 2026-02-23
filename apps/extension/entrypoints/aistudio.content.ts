@@ -1,25 +1,127 @@
-import { createCapturePayload, extractAiStudioTurns, materializeAttachmentsOrThrow } from "./lib/extractor";
+import {
+  applyDriveAttachments,
+  beginCaptureSessionWindow,
+  createCapturePayload,
+  extractAiStudioTurns,
+  materializeAttachmentsOrThrow,
+  warmupSourceLazyResources
+} from "./lib/extractor";
+
+const AI_STUDIO_CAPTURE_DEBUG_VERSION = "2026-02-23-r9-real-attachments";
+const AI_STUDIO_CAPTURE_BIND_KEY = "__AI_HISTORY_AISTUDIO_CAPTURE_BOUND__";
 
 export default defineContentScript({
   matches: ["https://aistudio.google.com/*"],
   runAt: "document_idle",
   main() {
+    const globalWindow = window as Window & Record<string, unknown>;
+    if (globalWindow[AI_STUDIO_CAPTURE_BIND_KEY]) {
+      return;
+    }
+    globalWindow[AI_STUDIO_CAPTURE_BIND_KEY] = true;
+
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (message?.type === "AI_HISTORY_PING") {
+        sendResponse({
+          ok: true,
+          source: "ai_studio",
+          version: AI_STUDIO_CAPTURE_DEBUG_VERSION
+        });
+        return;
+      }
+
       if (message?.type !== "AI_HISTORY_CAPTURE") {
         return;
       }
 
       void (async () => {
+        const captureRunId = typeof message?.captureRunId === "string" ? message.captureRunId : "";
+        const emitProgress = (
+          phase: "content" | "files",
+          percent: number,
+          status: string,
+          extra: Record<string, unknown> = {}
+        ) => {
+          if (!captureRunId) {
+            return;
+          }
+          try {
+            void chrome.runtime.sendMessage({
+              type: "AI_HISTORY_CAPTURE_PROGRESS",
+              runId: captureRunId,
+              phase,
+              percent,
+              status,
+              ...extra
+            });
+          } catch {
+            // ignore
+          }
+        };
+
+        beginCaptureSessionWindow();
+        emitProgress("content", 5, "正在加载页面内容");
+        await warmupSourceLazyResources("ai_studio");
+        emitProgress("content", 45, "正在解析对话");
         const turns = extractAiStudioTurns();
         if (!turns.length) {
           sendResponse({ ok: false, error: "未提取到会话内容" });
           return;
         }
 
-        const finalizedTurns = await materializeAttachmentsOrThrow("ai_studio", turns);
+        emitProgress("content", 70, "正在关联附件线索");
+        const withDrive = applyDriveAttachments(turns);
+        emitProgress("content", 100, "对话内容已提取");
+        const totalAttachments = withDrive.reduce((sum, turn) => sum + (turn.attachments?.length ?? 0), 0);
+        emitProgress("files", 0, totalAttachments > 0 ? "正在下载附件" : "无附件", {
+          processed: 0,
+          total: totalAttachments,
+          failed: 0
+        });
+        let finalizedTurns = withDrive;
+        let attachmentStageError = "";
+        try {
+          finalizedTurns = await materializeAttachmentsOrThrow("ai_studio", withDrive, {
+            continueOnFailure: true,
+            onProgress: ({ processed, total, failed }) => {
+              const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+              emitProgress("files", percent, "正在下载附件", {
+                processed,
+                total,
+                failed
+              });
+            }
+          });
+        } catch (error) {
+          attachmentStageError = error instanceof Error ? error.message : String(error);
+          console.warn("[AI_HISTORY] ai_studio attachment stage failed, fallback to content-only import", error);
+          emitProgress("files", 100, "附件阶段失败，已降级为仅导入文本", {
+            processed: 0,
+            total: totalAttachments,
+            failed: totalAttachments
+          });
+        }
+        const failedCount = finalizedTurns.reduce(
+          (sum, turn) => sum + (turn.attachments?.filter((attachment) => attachment.status === "failed").length ?? 0),
+          0
+        );
+        const finalTotal = finalizedTurns.reduce((sum, turn) => sum + (turn.attachments?.length ?? 0), 0);
+        emitProgress("files", 100, failedCount > 0 ? `附件完成，失败 ${failedCount}` : "附件下载完成", {
+          processed: finalTotal,
+          total: finalTotal,
+          failed: failedCount
+        });
+        const warnings: string[] = [];
+        if (attachmentStageError) {
+          warnings.push(`附件阶段异常：${attachmentStageError}`);
+        }
+        if (failedCount > 0) {
+          warnings.push(`附件下载失败 ${failedCount}/${finalTotal}`);
+        }
         sendResponse({
           ok: true,
-          payload: createCapturePayload("ai_studio", finalizedTurns)
+          payload: createCapturePayload("ai_studio", finalizedTurns),
+          warning: warnings.length > 0 ? warnings.join("；") : undefined
         });
       })().catch((error) => {
         sendResponse({
