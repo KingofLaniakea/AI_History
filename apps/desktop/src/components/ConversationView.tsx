@@ -15,6 +15,9 @@ export function ConversationView({ conversation }: ConversationViewProps) {
 
   useEffect(() => {
     setActivePair(0);
+    if (messageContainerRef.current) {
+      messageContainerRef.current.scrollTop = 0;
+    }
   }, [conversation?.id]);
 
   const pairTargets = useMemo(() => {
@@ -30,9 +33,11 @@ export function ConversationView({ conversation }: ConversationViewProps) {
     const bounded = Math.max(0, Math.min(index, pairs.length - 1));
     setActivePair(bounded);
     const target = pairTargets[bounded];
+    const container = messageContainerRef.current;
     const element = document.getElementById(`msg-${target}`);
-    if (element) {
-      element.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (container && element) {
+      const offsetTop = element.offsetTop - container.offsetTop;
+      container.scrollTo({ top: offsetTop, behavior: "smooth" });
     }
   };
 

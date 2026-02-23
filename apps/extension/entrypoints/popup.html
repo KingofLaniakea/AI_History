@@ -58,6 +58,39 @@
       #status.ok {
         color: #0a6d3a;
       }
+      #status.warn {
+        color: #8a4f00;
+      }
+      .progress-panel {
+        display: none;
+        border: 1px dashed var(--border);
+        border-radius: 10px;
+        padding: 8px;
+        gap: 8px;
+      }
+      .progress-panel.active {
+        display: flex;
+        flex-direction: column;
+      }
+      .progress-row {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .progress-bar {
+        width: 100%;
+        height: 8px;
+        background: #efe8dc;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        width: 0%;
+        height: 100%;
+        background: linear-gradient(90deg, #46a29f, #116a68);
+        transition: width 0.2s ease;
+      }
     </style>
   </head>
   <body>
@@ -66,6 +99,12 @@
       <div class="muted">适用于当前打开的 ChatGPT / Gemini / AI Studio 页面</div>
       <input id="capture-url" type="url" placeholder="粘贴会话链接 https://..." />
       <button id="capture-url-btn">打开链接并抓取</button>
+      <div id="progress-panel" class="progress-panel">
+        <div class="progress-row"><span>内容</span><span id="content-progress-text">0%</span></div>
+        <div class="progress-bar"><div id="content-progress-fill" class="progress-fill"></div></div>
+        <div class="progress-row"><span>附件</span><span id="files-progress-text">0%</span></div>
+        <div class="progress-bar"><div id="files-progress-fill" class="progress-fill"></div></div>
+      </div>
       <div id="status" class="muted"></div>
     </div>
     <script type="module">
@@ -73,21 +112,98 @@
       const currentBtn = document.getElementById("capture-current");
       const urlInput = document.getElementById("capture-url");
       const captureUrlBtn = document.getElementById("capture-url-btn");
+      const progressPanel = document.getElementById("progress-panel");
+      const contentProgressText = document.getElementById("content-progress-text");
+      const filesProgressText = document.getElementById("files-progress-text");
+      const contentProgressFill = document.getElementById("content-progress-fill");
+      const filesProgressFill = document.getElementById("files-progress-fill");
+
+      let activeRunId = "";
+      let active = false;
 
       function setStatus(text, kind = "muted") {
         statusEl.textContent = text;
         statusEl.className = kind;
       }
 
+      function clampPercent(value) {
+        const n = Number(value) || 0;
+        return Math.max(0, Math.min(100, Math.round(n)));
+      }
+
+      function setButtonsBusy(busy) {
+        currentBtn.disabled = busy;
+        captureUrlBtn.disabled = busy;
+      }
+
+      function setProgress(phase, percent, detail = null) {
+        const safe = clampPercent(percent);
+        if (phase === "content") {
+          contentProgressFill.style.width = `${safe}%`;
+          contentProgressText.textContent = detail || `${safe}%`;
+          return;
+        }
+        filesProgressFill.style.width = `${safe}%`;
+        filesProgressText.textContent = detail || `${safe}%`;
+      }
+
+      function startRun(statusText) {
+        activeRunId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        active = true;
+        setButtonsBusy(true);
+        progressPanel.classList.add("active");
+        setProgress("content", 0, "0%");
+        setProgress("files", 0, "0%");
+        setStatus(statusText, "muted");
+        return activeRunId;
+      }
+
+      function finishRun(ok, text, warningText = "") {
+        active = false;
+        setButtonsBusy(false);
+        if (warningText) {
+          setStatus(`${text}；告警：${warningText}`, "warn");
+          return;
+        }
+        setStatus(text, ok ? "ok" : "error");
+      }
+
+      chrome.runtime.onMessage.addListener((message) => {
+        if (!message || message.type !== "CAPTURE_PROGRESS") {
+          return;
+        }
+        if (!active || !activeRunId || message.runId !== activeRunId) {
+          return;
+        }
+
+        const phase = message.phase === "files" ? "files" : "content";
+        const percent = clampPercent(message.percent);
+        let detail = `${percent}%`;
+        if (phase === "files") {
+          const processed = Number(message.processed || 0);
+          const total = Number(message.total || 0);
+          const failed = Number(message.failed || 0);
+          if (total > 0) {
+            detail = `${percent}% (${processed}/${total}${failed > 0 ? `, 失败 ${failed}` : ""})`;
+          }
+        }
+        setProgress(phase, percent, detail);
+        if (message.status) {
+          setStatus(message.status, "muted");
+        }
+      });
+
       currentBtn.addEventListener("click", () => {
-        setStatus("正在抓取当前标签页...");
-        chrome.runtime.sendMessage({ type: "CAPTURE_CURRENT_TAB" }, (response) => {
+        const runId = startRun("正在抓取当前标签页...");
+        chrome.runtime.sendMessage({ type: "CAPTURE_CURRENT_TAB", runId }, (response) => {
           if (!response?.ok) {
-            setStatus(response?.error || "抓取失败", "error");
+            finishRun(false, response?.error || "抓取失败");
             return;
           }
 
-          setStatus(response.message || "已导入", "ok");
+          setProgress("content", 100);
+          setProgress("files", 100);
+          finishRun(true, response.message || "已导入", response.warning || "");
         });
       });
 
@@ -98,14 +214,16 @@
           return;
         }
 
-        setStatus("正在打开链接并抓取...");
-        chrome.runtime.sendMessage({ type: "CAPTURE_URL", url }, (response) => {
+        const runId = startRun("正在打开链接并抓取...");
+        chrome.runtime.sendMessage({ type: "CAPTURE_URL", url, runId }, (response) => {
           if (!response?.ok) {
-            setStatus(response?.error || "抓取失败", "error");
+            finishRun(false, response?.error || "抓取失败");
             return;
           }
 
-          setStatus(response.message || "已导入", "ok");
+          setProgress("content", 100);
+          setProgress("files", 100);
+          finishRun(true, response.message || "已导入", response.warning || "");
         });
       });
     </script>

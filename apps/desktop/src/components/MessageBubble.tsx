@@ -298,6 +298,44 @@ function decodeURIComponentSafe(value: string): string {
   }
 }
 
+function isDataUrl(value: string): boolean {
+  return value.trim().toLowerCase().startsWith("data:");
+}
+
+function parseDataUrlFileName(value: string): string {
+  if (!isDataUrl(value)) {
+    return "";
+  }
+  const meta = value.slice(5).split(",")[0] ?? "";
+  const parts = meta.split(";").map((item) => item.trim());
+  for (const part of parts) {
+    if (part.toLowerCase().startsWith("name=")) {
+      const raw = part.slice(5).trim().replace(/^["']+|["']+$/g, "");
+      const decoded = decodeURIComponentSafe(raw);
+      if (decoded) {
+        return decoded;
+      }
+    }
+  }
+  return "";
+}
+
+function fallbackDataFileName(attachment: AttachmentRef): string {
+  if (attachment.kind === "image") {
+    if ((attachment.mime || "").toLowerCase().includes("png")) {
+      return "image.png";
+    }
+    if ((attachment.mime || "").toLowerCase().includes("jpeg") || (attachment.mime || "").toLowerCase().includes("jpg")) {
+      return "image.jpg";
+    }
+    return "image";
+  }
+  if (attachment.kind === "pdf") {
+    return "document.pdf";
+  }
+  return "file";
+}
+
 function attachmentFileName(attachment: AttachmentRef): string {
   if (isVirtualAttachment(attachment.originalUrl)) {
     const raw = attachment.originalUrl.slice(VIRTUAL_ATTACHMENT_PREFIX.length).split("?")[0] ?? "";
@@ -305,11 +343,34 @@ function attachmentFileName(attachment: AttachmentRef): string {
     return decoded || "未命名文件";
   }
 
+  if (isDataUrl(attachment.originalUrl)) {
+    const fromData = parseDataUrlFileName(attachment.originalUrl);
+    if (fromData) {
+      return fromData;
+    }
+    return fallbackDataFileName(attachment);
+  }
+
   const href = resolveAttachmentHref(attachment);
   const clean = href.split("?")[0]?.split("#")[0] ?? href;
   const parts = clean.split("/");
   const rawName = parts[parts.length - 1] ?? "";
-  return decodeURIComponentSafe(rawName) || "未命名文件";
+  const decodedName = decodeURIComponentSafe(rawName).trim();
+  if (decodedName && decodedName.toLowerCase() !== "content" && decodedName.toLowerCase() !== "download") {
+    return decodedName;
+  }
+  try {
+    const parsed = new URL(href);
+    const estuaryId = parsed.searchParams.get("id") || parsed.searchParams.get("file_id") || parsed.searchParams.get("fileId") || "";
+    if (estuaryId) {
+      const base = decodeURIComponentSafe(estuaryId);
+      const ext = attachment.kind === "pdf" ? ".pdf" : attachment.kind === "image" ? ".jpg" : "";
+      return `${base}${ext}`;
+    }
+  } catch {
+    // ignore url parse failures
+  }
+  return decodedName || "未命名文件";
 }
 
 function resolveAttachmentHref(attachment: AttachmentRef): string {
@@ -331,20 +392,32 @@ function resolveAttachmentPreviewSrc(attachment: AttachmentRef): string | null {
   if (attachment.kind !== "image") {
     return null;
   }
-  if (attachment.status !== "cached" || !attachment.localPath) {
+  if (attachment.status === "cached" && attachment.localPath) {
+    return resolveAttachmentHref(attachment);
+  }
+  if (attachment.status === "cached" && isDataUrl(attachment.originalUrl)) {
+    return attachment.originalUrl;
+  }
+  if (attachment.status !== "cached") {
     return null;
   }
-  return resolveAttachmentHref(attachment);
+  return null;
 }
 
 function resolvePdfPreviewSrc(attachment: AttachmentRef): string | null {
   if (attachment.kind !== "pdf") {
     return null;
   }
-  if (attachment.status !== "cached" || !attachment.localPath) {
+  if (attachment.status === "cached" && attachment.localPath) {
+    return `${resolveAttachmentHref(attachment)}#page=1&view=FitH&toolbar=0`;
+  }
+  if (attachment.status === "cached" && isDataUrl(attachment.originalUrl)) {
+    return `${attachment.originalUrl}#page=1&view=FitH&toolbar=0`;
+  }
+  if (attachment.status !== "cached") {
     return null;
   }
-  return `${resolveAttachmentHref(attachment)}#page=1&view=FitH&toolbar=0`;
+  return null;
 }
 
 function isHashLink(href: string): boolean {
@@ -353,6 +426,71 @@ function isHashLink(href: string): boolean {
 
 function isRemoteHttpUrl(target: string): boolean {
   return /^https?:\/\//i.test(target);
+}
+
+function normalizeComparableUrl(raw: string): string {
+  try {
+    const parsed = new URL(raw);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return raw.trim();
+  }
+}
+
+function extractBackendFileId(url: string): string {
+  const lowered = url.toLowerCase();
+  const downloadMatch = lowered.match(/\/backend-api\/files\/download\/([^/?#]+)/i);
+  if (downloadMatch?.[1]) {
+    return decodeURIComponentSafe(downloadMatch[1]);
+  }
+  const directMatch = lowered.match(/\/backend-api\/files\/([^/?#]+)/i);
+  if (directMatch?.[1] && directMatch[1] !== "download") {
+    return decodeURIComponentSafe(directMatch[1]);
+  }
+  const estuaryMatch = lowered.match(/\/backend-api\/estuary\/content[^\s]*/i);
+  if (estuaryMatch?.[0]) {
+    try {
+      const parsed = new URL(url);
+      const id = parsed.searchParams.get("id") || "";
+      return id ? decodeURIComponentSafe(id) : "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+function isBackendGeneratedAttachmentUrl(url: string): boolean {
+  const lowered = url.toLowerCase();
+  return /\/backend-api\/estuary\/content|\/backend-api\/files\//i.test(lowered);
+}
+
+function isGenericBackendAttachmentName(name: string): boolean {
+  const lowered = name.trim().toLowerCase();
+  if (!lowered) {
+    return true;
+  }
+  return (
+    lowered === "content" ||
+    lowered === "download" ||
+    /^file_[a-z0-9]+$/.test(lowered)
+  );
+}
+
+function attachmentSemanticDisplayKey(attachment: AttachmentRef): string {
+  const href = resolveAttachmentHref(attachment) || attachment.originalUrl;
+  if (isVirtualAttachment(attachment.originalUrl)) {
+    return `virtual:${attachmentFileName(attachment).toLowerCase()}`;
+  }
+  if (isDataUrl(attachment.originalUrl)) {
+    return `data:${attachment.kind}:${(attachment.originalUrl || "").slice(0, 100)}`;
+  }
+  const fileId = extractBackendFileId(href);
+  if (fileId) {
+    return `fileid:${fileId.toLowerCase()}`;
+  }
+  return `url:${attachment.kind}:${href.toLowerCase()}`;
 }
 
 function looksLikeFileAttachment(url: string): boolean {
@@ -536,9 +674,9 @@ export function MessageBubble({
   const thoughtMarkdown = message.thoughtMarkdown ? toRenderableMarkdown(message.thoughtMarkdown) : "";
   const displayAttachments = React.useMemo(() => {
     const seen = new Set<string>();
-    return attachments.filter((attachment) => {
+    const filtered = attachments.filter((attachment) => {
       const href = resolveAttachmentHref(attachment) || attachment.originalUrl;
-      const key = `${attachment.kind}:${href}`;
+      const key = attachmentSemanticDisplayKey(attachment);
       if (seen.has(key)) {
         return false;
       }
@@ -547,7 +685,7 @@ export function MessageBubble({
         if (
           message.role !== "user" &&
           attachment.kind === "pdf" &&
-          attachment.status !== "cached" &&
+          attachment.status === "remote_only" &&
           !isVirtualAttachment(attachment.originalUrl) &&
           isRemoteHttpUrl(href)
         ) {
@@ -557,7 +695,7 @@ export function MessageBubble({
       }
       if (
         message.role !== "user" &&
-        attachment.status !== "cached" &&
+        attachment.status === "remote_only" &&
         !isVirtualAttachment(attachment.originalUrl) &&
         isRemoteHttpUrl(href)
       ) {
@@ -568,11 +706,51 @@ export function MessageBubble({
       }
       return looksLikeFileAttachment(href);
     });
+    const hasCachedImage = filtered.some((attachment) => {
+      if (attachment.kind !== "image") {
+        return false;
+      }
+      return Boolean(resolveAttachmentPreviewSrc(attachment));
+    });
+    if (!hasCachedImage) {
+      return filtered;
+    }
+    return filtered.filter((attachment) => {
+      const href = resolveAttachmentHref(attachment) || attachment.originalUrl;
+      if (attachment.kind !== "image") {
+        return true;
+      }
+      if (attachment.status === "cached") {
+        return true;
+      }
+      if (!isBackendGeneratedAttachmentUrl(href)) {
+        return true;
+      }
+      const name = attachmentFileName(attachment);
+      return !isGenericBackendAttachmentName(name);
+    });
   }, [attachments, message.role]);
   const displayContent = React.useMemo(
     () => stripAttachmentHeadlineLines(message.contentMarkdown, displayAttachments),
     [message.contentMarkdown, displayAttachments]
   );
+  const imageAttachmentUrlKeys = React.useMemo(() => {
+    const keys = new Set<string>();
+    for (const attachment of displayAttachments) {
+      if (attachment.kind !== "image") {
+        continue;
+      }
+      const href = resolveAttachmentHref(attachment);
+      if (href && isRemoteHttpUrl(href)) {
+        keys.add(normalizeComparableUrl(href));
+      }
+      if (isRemoteHttpUrl(attachment.originalUrl)) {
+        keys.add(normalizeComparableUrl(attachment.originalUrl));
+      }
+    }
+    return keys;
+  }, [displayAttachments]);
+  const hasImageAttachment = displayAttachments.some((attachment) => attachment.kind === "image");
 
   const openExternalTarget = React.useCallback((target: string) => {
     void api.openExternal(target).catch((error) => {
@@ -610,6 +788,10 @@ export function MessageBubble({
           return null;
         }
         if (isRemoteHttpUrl(imageSrc)) {
+          const normalized = normalizeComparableUrl(imageSrc);
+          if (hasImageAttachment && (imageAttachmentUrlKeys.has(normalized) || imageAttachmentUrlKeys.size > 0)) {
+            return null;
+          }
           return (
             <a
               href={imageSrc}
@@ -627,7 +809,7 @@ export function MessageBubble({
         return <img {...props} src={imageSrc} alt={alt ?? "image"} loading="lazy" />;
       }
     };
-  }, [openExternalTarget]);
+  }, [hasImageAttachment, imageAttachmentUrlKeys, openExternalTarget]);
 
   return (
     <article className={`message-bubble role-${message.role}`} id={id}>

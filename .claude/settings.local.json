@@ -5,7 +5,16 @@
       "Bash(npm install:*)",
       "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs)",
       "Bash(sh:*)",
-      "Bash(sips:*)"
+      "Bash(sips:*)",
+      "Bash(git -C /Users/tpmam/code/AIhistory diff apps/extension/entrypoints/background.ts)",
+      "Bash(pnpm exec tsc:*)",
+      "Bash(pnpm build:*)",
+      "Bash(pnpm install:*)",
+      "Bash(pnpm --filter @ai-history/core-types install:*)",
+      "Bash(pnpm -r --filter extension build:*)",
+      "Bash(pnpm dev:extension:*)",
+      "Bash(pnpm --filter extension build:*)",
+      "Bash(pnpm test:parsers:*)"
     ]
   }
 }

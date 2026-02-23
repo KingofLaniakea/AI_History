@@ -517,9 +517,12 @@ impl Database {
         let needs_attachment_cache = attachments
             .iter()
             .any(|attachment| {
-                (attachment.status == "remote_only" || attachment.status == "failed")
+                ((attachment.status == "remote_only" || attachment.status == "failed")
                     && !looks_like_cloud_drive_file_url(&attachment.original_url)
-                    && !is_virtual_attachment_url(&attachment.original_url)
+                    && !is_virtual_attachment_url(&attachment.original_url))
+                    || (attachment.status == "cached"
+                        && attachment.local_path.is_none()
+                        && is_data_url(&attachment.original_url))
             });
         if needs_attachment_cache {
             self.schedule_attachment_cache(conversation.id.clone());
@@ -1127,7 +1130,11 @@ impl Database {
                     FROM attachments
                     JOIN conversations c ON c.id = a.conversation_id
                     WHERE a.conversation_id = ?1
-                      AND (a.status = 'remote_only' OR a.status = 'failed')
+                      AND (
+                        a.status = 'remote_only'
+                        OR a.status = 'failed'
+                        OR (a.status = 'cached' AND a.local_path IS NULL AND a.original_url LIKE 'data:%')
+                      )
                     ORDER BY a.created_at ASC
                     "#,
                 )
@@ -2149,6 +2156,140 @@ fn decode_data_url(url: &str) -> Option<(Option<String>, Vec<u8>)> {
     Some((mime, bytes))
 }
 
+fn hex_to_u8(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(10 + byte - b'a'),
+        b'A'..=b'F' => Some(10 + byte - b'A'),
+        _ => None,
+    }
+}
+
+fn decode_url_component_lossy(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'+' {
+            out.push(b' ');
+            idx += 1;
+            continue;
+        }
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_to_u8(bytes[idx + 1]), hex_to_u8(bytes[idx + 2]))
+            {
+                out.push((high << 4) | low);
+                idx += 3;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn sanitize_filename(input: &str) -> String {
+    let trimmed = input.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .chars()
+        .map(|ch| match ch {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            control if control.is_control() => '_',
+            value => value,
+        })
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(240)
+        .collect::<String>()
+}
+
+fn parse_content_disposition_filename(raw: &str) -> Option<String> {
+    for segment in raw.split(';') {
+        let part = segment.trim();
+        if let Some(value) = part.strip_prefix("filename*=") {
+            let stripped = value.trim().trim_matches('"').trim_matches('\'');
+            let encoded = stripped
+                .split("''")
+                .last()
+                .map(str::trim)
+                .unwrap_or_default();
+            let decoded = sanitize_filename(&decode_url_component_lossy(encoded));
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    for segment in raw.split(';') {
+        let part = segment.trim();
+        if let Some(value) = part.strip_prefix("filename=") {
+            let decoded = sanitize_filename(&decode_url_component_lossy(value));
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn extract_data_url_filename(url: &str) -> Option<String> {
+    if !is_data_url(url) {
+        return None;
+    }
+    let (meta, _) = url.split_once(',')?;
+    for segment in meta.split(';').skip(1) {
+        let part = segment.trim();
+        if let Some(value) = part.strip_prefix("name=") {
+            let decoded = sanitize_filename(&decode_url_component_lossy(value));
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+        if let Some(value) = part.strip_prefix("filename=") {
+            let decoded = sanitize_filename(&decode_url_component_lossy(value));
+            if !decoded.is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn extract_filename_from_url(url: &str) -> Option<String> {
+    if let Some(name) = extract_data_url_filename(url) {
+        return Some(name);
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    for (key, value) in parsed.query_pairs() {
+        let key_l = key.to_lowercase();
+        if key_l == "filename" || key_l == "file" || key_l == "name" {
+            let normalized = sanitize_filename(&decode_url_component_lossy(value.as_ref()));
+            if !normalized.is_empty() {
+                return Some(normalized);
+            }
+        }
+        if key_l == "response-content-disposition" {
+            if let Some(name) = parse_content_disposition_filename(value.as_ref()) {
+                return Some(name);
+            }
+        }
+    }
+    let segment = parsed
+        .path_segments()
+        .and_then(|segments| segments.filter(|item| !item.is_empty()).last())
+        .map(decode_url_component_lossy)
+        .map(|name| sanitize_filename(&name))
+        .unwrap_or_default();
+    if segment.contains('.') && !segment.is_empty() {
+        return Some(segment);
+    }
+    None
+}
+
 fn is_virtual_attachment_url(url: &str) -> bool {
     url.to_lowercase().starts_with("aihistory://upload/")
 }
@@ -2163,6 +2304,9 @@ fn is_http_or_https_url(url: &str) -> bool {
 fn looks_like_image_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     if lower.starts_with("data:image/") {
+        return true;
+    }
+    if lower.contains("/backend-api/estuary/content") {
         return true;
     }
     if lower.contains("format=png")
@@ -2258,6 +2402,7 @@ fn looks_like_file_url(url: &str) -> bool {
         return true;
     }
     if lower.contains("/backend-api/files/")
+        || lower.contains("/backend-api/estuary/content")
         || lower.contains("/api/files/")
         || lower.contains("/files/")
     {
@@ -2279,6 +2424,18 @@ fn is_navigation_url(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
+    let lower = parsed.as_str().to_lowercase();
+    if lower.contains("/backend-api/files/")
+        || lower.contains("/backend-api/estuary/content")
+        || lower.contains("/api/files/")
+        || lower.contains("/files/")
+        || lower.contains("/prompts/")
+        || looks_like_file_url(parsed.as_str())
+        || looks_like_image_url(parsed.as_str())
+        || looks_like_pdf_url(parsed.as_str())
+    {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -2319,8 +2476,36 @@ fn infer_file_extension(url: &str, mime: Option<&str>) -> String {
         if lower.contains("ms-powerpoint") {
             return "ppt".to_string();
         }
+        if lower.contains("spreadsheetml.sheet") {
+            return "xlsx".to_string();
+        }
+        if lower.contains("ms-excel") {
+            return "xls".to_string();
+        }
         if lower.contains("text/markdown") {
             return "md".to_string();
+        }
+        if lower.contains("text/plain") {
+            return "txt".to_string();
+        }
+        if lower.contains("text/csv") {
+            return "csv".to_string();
+        }
+        if lower.contains("tab-separated-values") {
+            return "tsv".to_string();
+        }
+        if lower.contains("application/json") {
+            return "json".to_string();
+        }
+    }
+
+    if let Some(file_name) = extract_filename_from_url(url) {
+        let name_ext = extract_url_extension(&file_name);
+        if !name_ext.is_empty()
+            && name_ext.len() <= 10
+            && name_ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        {
+            return name_ext;
         }
     }
 
