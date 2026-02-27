@@ -4,8 +4,10 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import type { AttachmentRef } from "@ai-history/core-types";
 import { api } from "../lib/api";
+import { isTauri } from "../lib/tauri";
 import type { Message } from "../lib/types";
 
 const ROLE_LABEL: Record<Message["role"], string> = {
@@ -388,15 +390,37 @@ function resolveAttachmentHref(attachment: AttachmentRef): string {
   return attachment.originalUrl;
 }
 
+function resolveAttachmentPreviewHref(attachment: AttachmentRef): string {
+  if (isVirtualAttachment(attachment.originalUrl)) {
+    return "";
+  }
+  if (attachment.localPath) {
+    if (/^https?:\/\//i.test(attachment.localPath)) {
+      return attachment.localPath;
+    }
+    try {
+      if (isTauri) {
+        return convertFileSrc(attachment.localPath);
+      }
+    } catch {
+      // fallback to file:// when convertFileSrc is unavailable
+    }
+    const normalized = attachment.localPath.replace(/\\/g, "/");
+    const encoded = normalized.replace(/ /g, "%20");
+    return encoded.startsWith("file://") ? encoded : `file://${encoded}`;
+  }
+  return attachment.originalUrl;
+}
+
 function resolveAttachmentPreviewSrc(attachment: AttachmentRef): string | null {
   if (attachment.kind !== "image") {
     return null;
   }
-  if (attachment.status === "cached" && attachment.localPath) {
-    return resolveAttachmentHref(attachment);
-  }
   if (attachment.status === "cached" && isDataUrl(attachment.originalUrl)) {
     return attachment.originalUrl;
+  }
+  if (attachment.status === "cached" && attachment.localPath) {
+    return resolveAttachmentPreviewHref(attachment);
   }
   if (attachment.status !== "cached") {
     return null;
@@ -408,11 +432,11 @@ function resolvePdfPreviewSrc(attachment: AttachmentRef): string | null {
   if (attachment.kind !== "pdf") {
     return null;
   }
-  if (attachment.status === "cached" && attachment.localPath) {
-    return `${resolveAttachmentHref(attachment)}#page=1&view=FitH&toolbar=0`;
-  }
   if (attachment.status === "cached" && isDataUrl(attachment.originalUrl)) {
     return `${attachment.originalUrl}#page=1&view=FitH&toolbar=0`;
+  }
+  if (attachment.status === "cached" && attachment.localPath) {
+    return `${resolveAttachmentPreviewHref(attachment)}#page=1&view=FitH&toolbar=0`;
   }
   if (attachment.status !== "cached") {
     return null;
@@ -426,6 +450,21 @@ function isHashLink(href: string): boolean {
 
 function isRemoteHttpUrl(target: string): boolean {
   return /^https?:\/\//i.test(target);
+}
+
+function isLikelyRemoteImageUrl(target: string): boolean {
+  const lower = target.toLowerCase();
+  if (/\/backend-api\/estuary\/content/i.test(lower)) {
+    return true;
+  }
+  if (/[?&]mime=image\//i.test(lower)) {
+    return true;
+  }
+  if (/[?&]format=(png|jpg|jpeg|webp|gif|bmp|svg)\b/i.test(lower)) {
+    return true;
+  }
+  const clean = lower.split("?")[0]?.split("#")[0] ?? lower;
+  return /\.(png|jpg|jpeg|webp|gif|bmp|svg)$/.test(clean);
 }
 
 function normalizeComparableUrl(raw: string): string {
@@ -474,7 +513,8 @@ function isGenericBackendAttachmentName(name: string): boolean {
   return (
     lowered === "content" ||
     lowered === "download" ||
-    /^file_[a-z0-9]+$/.test(lowered)
+    /^file[_-][a-z0-9]+(?:\.[a-z0-9]{2,6})?$/.test(lowered) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.[a-z0-9]{2,6})?$/.test(lowered)
   );
 }
 
@@ -676,11 +716,19 @@ export function MessageBubble({
     const seen = new Set<string>();
     const filtered = attachments.filter((attachment) => {
       const href = resolveAttachmentHref(attachment) || attachment.originalUrl;
+      const name = attachmentFileName(attachment);
       const key = attachmentSemanticDisplayKey(attachment);
       if (seen.has(key)) {
         return false;
       }
       seen.add(key);
+      if (
+        attachment.status === "failed" &&
+        isBackendGeneratedAttachmentUrl(href) &&
+        isGenericBackendAttachmentName(name)
+      ) {
+        return false;
+      }
       if (attachment.kind !== "file") {
         if (
           message.role !== "user" &&
@@ -764,6 +812,12 @@ export function MessageBubble({
       a: ({ node: _node, href, children, onClick: _onClick, ...props }) => {
         const link = typeof href === "string" ? href : "";
         const hashLink = isHashLink(link);
+        if (link && isRemoteHttpUrl(link)) {
+          const normalized = normalizeComparableUrl(link);
+          if (imageAttachmentUrlKeys.has(normalized) || isLikelyRemoteImageUrl(link)) {
+            return null;
+          }
+        }
         return (
           <a
             {...props}
@@ -788,23 +842,7 @@ export function MessageBubble({
           return null;
         }
         if (isRemoteHttpUrl(imageSrc)) {
-          const normalized = normalizeComparableUrl(imageSrc);
-          if (hasImageAttachment && (imageAttachmentUrlKeys.has(normalized) || imageAttachmentUrlKeys.size > 0)) {
-            return null;
-          }
-          return (
-            <a
-              href={imageSrc}
-              target="_blank"
-              rel="noreferrer"
-              onClick={(event) => {
-                event.preventDefault();
-                openExternalTarget(imageSrc);
-              }}
-            >
-              {alt ? `${alt}（外部图片，点击打开）` : "外部图片（点击打开）"}
-            </a>
-          );
+          return null;
         }
         return <img {...props} src={imageSrc} alt={alt ?? "image"} loading="lazy" />;
       }

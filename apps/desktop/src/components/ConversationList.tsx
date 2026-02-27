@@ -142,7 +142,15 @@ export function ConversationList({
               </div>
             ))
           : conversations.map((conversation) => renderItem(conversation))}
-        {conversations.length === 0 && <div className="empty-state">暂无会话，先导入数据或通过插件抓取。</div>}
+        {conversations.length === 0 && (
+          <div className="empty-state">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--border)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom: 12 }}>
+              <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+            </svg>
+            <p style={{ margin: 0, fontWeight: 500, color: 'var(--text-secondary)' }}>暂无会话</p>
+            <p style={{ margin: 0, fontSize: 13 }}>先导入数据或通过插件抓取。</p>
+          </div>
+        )}
       </div>
     </section>
   );

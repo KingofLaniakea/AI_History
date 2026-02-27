@@ -7,7 +7,7 @@ import {
   warmupSourceLazyResources
 } from "./lib/extractor";
 
-const GEMINI_CAPTURE_DEBUG_VERSION = "2026-02-23-r9-real-attachments";
+const GEMINI_CAPTURE_DEBUG_VERSION = "2026-02-27-r31-react-handler-prime-for-word";
 const GEMINI_CAPTURE_BIND_KEY = "__AI_HISTORY_GEMINI_CAPTURE_BOUND__";
 
 export default defineContentScript({

@@ -1127,7 +1127,7 @@ impl Database {
                 .prepare(
                     r#"
                     SELECT a.id, a.kind, a.original_url, a.mime, c.source
-                    FROM attachments
+                    FROM attachments a
                     JOIN conversations c ON c.id = a.conversation_id
                     WHERE a.conversation_id = ?1
                       AND (
@@ -2304,9 +2304,6 @@ fn is_http_or_https_url(url: &str) -> bool {
 fn looks_like_image_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     if lower.starts_with("data:image/") {
-        return true;
-    }
-    if lower.contains("/backend-api/estuary/content") {
         return true;
     }
     if lower.contains("format=png")

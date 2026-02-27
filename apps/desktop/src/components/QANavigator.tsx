@@ -62,6 +62,7 @@ export function QASideSlider({
   onJump: (index: number) => void;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
+  const lastDragIndexRef = useRef<number>(-1);
   const pairCount = pairs.length;
   const railInsetRatio = 0.065;
   const railSpanRatio = 1 - railInsetRatio * 2;
@@ -70,17 +71,15 @@ export function QASideSlider({
     return null;
   }
 
-  const jumpByClientY = (clientY: number) => {
-    const track = trackRef.current;
-    if (!track || pairCount <= 1) {
-      return;
-    }
+  const thumbHeight = Math.max(20, Math.min(80, 240 / pairCount));
 
+  const indexFromClientY = (clientY: number): number => {
+    const track = trackRef.current;
+    if (!track || pairCount <= 1) return 0;
     const rect = track.getBoundingClientRect();
     const trackRatio = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
     const ratio = Math.max(0, Math.min(1, (trackRatio - railInsetRatio) / railSpanRatio));
-    const index = Math.round(ratio * (pairCount - 1));
-    onJump(index);
+    return Math.round(ratio * (pairCount - 1));
   };
 
   const activeRatio = pairCount <= 1 ? 0 : activePair / (pairCount - 1);
@@ -88,17 +87,10 @@ export function QASideSlider({
 
   return (
     <aside className="qa-side-slider" aria-label="问答快速跳转">
-      <button
-        className="qa-side-step"
-        onClick={() => onJump(Math.max(activePair - 1, 0))}
-        title="上一问"
-      >
-        上
-      </button>
       <div
         className="qa-side-track"
         ref={trackRef}
-        onClick={(event) => jumpByClientY(event.clientY)}
+        onClick={(event) => onJump(indexFromClientY(event.clientY))}
       >
         <div className="qa-side-track-line" />
         {pairs.map((pair, index) => {
@@ -119,10 +111,18 @@ export function QASideSlider({
         })}
         <div
           className="qa-side-thumb"
-          style={{ top: `${activeTrackRatio * 100}%` }}
+          style={{ top: `${activeTrackRatio * 100}%`, height: `${thumbHeight}px` }}
           onPointerDown={(event) => {
-            const handleMove = (moveEvent: PointerEvent) => jumpByClientY(moveEvent.clientY);
+            lastDragIndexRef.current = activePair;
+            const handleMove = (moveEvent: PointerEvent) => {
+              const idx = indexFromClientY(moveEvent.clientY);
+              if (idx !== lastDragIndexRef.current) {
+                lastDragIndexRef.current = idx;
+                onJump(idx);
+              }
+            };
             const handleUp = () => {
+              lastDragIndexRef.current = -1;
               window.removeEventListener("pointermove", handleMove);
               window.removeEventListener("pointerup", handleUp);
             };
@@ -132,13 +132,6 @@ export function QASideSlider({
           }}
         />
       </div>
-      <button
-        className="qa-side-step"
-        onClick={() => onJump(Math.min(activePair + 1, pairCount - 1))}
-        title="下一问"
-      >
-        下
-      </button>
     </aside>
   );
 }

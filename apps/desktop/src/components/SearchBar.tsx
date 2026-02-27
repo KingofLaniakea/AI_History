@@ -9,8 +9,6 @@ interface SearchBarProps {
 }
 
 export function SearchBar({ value, onChange, source, onSourceChange }: SearchBarProps) {
-  const exportMutation = useExportBackup();
-
   return (
     <div className="top-toolbar">
       <div className="search-input-wrap">
@@ -38,17 +36,6 @@ export function SearchBar({ value, onChange, source, onSourceChange }: SearchBar
         <option value="gemini">Gemini</option>
         <option value="ai_studio">AI Studio</option>
       </select>
-      <button
-        onClick={() => {
-          exportMutation.mutate(undefined, {
-            onSuccess: (name) => {
-              window.alert(`备份已导出: ${name}`);
-            }
-          });
-        }}
-      >
-        导出备份
-      </button>
     </div>
   );
 }

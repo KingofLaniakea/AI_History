@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, options, post};
@@ -74,7 +74,8 @@ pub async fn start_bridge_server(state: BridgeState) -> Result<(), String> {
                 .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
                 .allow_headers(Any)
                 .allow_origin(Any),
-        );
+        )
+        .layer(DefaultBodyLimit::max(100 * 1024 * 1024));
 
     let addr: SocketAddr = "127.0.0.1:48765"
         .parse()

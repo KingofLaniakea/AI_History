@@ -1,10 +1,8 @@
 import React, { useMemo } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ConversationList } from "./components/ConversationList";
 import { ConversationView } from "./components/ConversationView";
-import { FolderTree } from "./components/FolderTree";
+import { ExplorerSidebar } from "./components/ExplorerSidebar";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { SearchBar } from "./components/SearchBar";
 import { useConversation, useConversations, useFolders, useMoveConversation, useSearch } from "./hooks/useData";
 import { useAppStore } from "./lib/store";
 
@@ -99,9 +97,19 @@ export function App() {
       <aside className={`left-column ${leftCollapsed ? "collapsed" : ""}`}>
         {!leftCollapsed ? (
           <>
-            <FolderTree
+            <ExplorerSidebar
               folders={folders.data ?? []}
+              conversations={listData}
               selectedFolderId={selectedFolderId}
+              selectedConversationId={selectedConversationId}
+              searchQuery={searchQuery}
+              sourceFilter={sourceFilter}
+              onSelectFolder={(id) => {
+                setSelectedFolderId(id);
+                setSelectedConversationId(null);
+                setSearchQuery("");
+              }}
+              onOpenConversation={setSelectedConversationId}
               onDropConversation={(conversationId, folderId) => {
                 void moveConversation
                   .mutateAsync({ id: conversationId, folderId })
@@ -110,33 +118,31 @@ export function App() {
                     window.alert(`移动失败：${message}`);
                   });
               }}
-              onSelect={(id) => {
-                setSelectedFolderId(id);
-                setSelectedConversationId(null);
-                setSearchQuery("");
-              }}
+              onSearchChange={setSearchQuery}
+              onSourceChange={setSourceFilter}
               onCollapse={() => setLeftCollapsed(true)}
+              groupByCreatedDate={!searchQuery.trim() && selectedFolderId === null}
             />
             <SettingsPanel folderId={selectedFolderId} />
           </>
         ) : (
           <div className="collapsed-sidebar">
             <button
-              className="collapsed-sidebar-btn"
+              className="collapsed-sidebar-btn active"
               onClick={() => setLeftCollapsed(false)}
-              title="展开文件夹栏"
+              title="资源管理器"
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
               </svg>
             </button>
-            <div className="collapsed-sidebar-line" />
+            <div className="collapsed-sidebar-spacer" />
             <button
               className="collapsed-sidebar-btn"
               onClick={() => setLeftCollapsed(false)}
               title="设置"
             >
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3" />
                 <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" />
               </svg>
@@ -144,21 +150,6 @@ export function App() {
           </div>
         )}
       </aside>
-
-      <main className="center-column">
-        <SearchBar
-          value={searchQuery}
-          onChange={setSearchQuery}
-          source={sourceFilter}
-          onSourceChange={setSourceFilter}
-        />
-        <ConversationList
-          conversations={listData}
-          selectedConversationId={selectedConversationId}
-          onOpen={setSelectedConversationId}
-          groupByCreatedDate={!searchQuery.trim() && selectedFolderId === null}
-        />
-      </main>
 
       <section className="right-column">
         <ConversationView conversation={selectedConversation.data ?? null} />

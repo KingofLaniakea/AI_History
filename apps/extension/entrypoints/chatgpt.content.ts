@@ -5,11 +5,36 @@ import {
   enrichChatGptTurnsWithApiAttachments,
   extractChatGptTurns,
   materializeAttachmentsOrThrow,
+  type CaptureTurn,
   warmupSourceLazyResources
 } from "./lib/extractor";
 
-const CHATGPT_CAPTURE_DEBUG_VERSION = "2026-02-23-r9-real-attachments";
+const CHATGPT_CAPTURE_DEBUG_VERSION = "2026-02-27-r31-react-handler-prime-for-word";
 const CHATGPT_CAPTURE_BIND_KEY = "__AI_HISTORY_CHATGPT_CAPTURE_BOUND__";
+
+interface AttachmentSummary {
+  attachmentCount: number;
+  inlinedCount: number;
+  failedCount: number;
+}
+
+function summarizeAttachments(turns: CaptureTurn[]): AttachmentSummary {
+  let attachmentCount = 0;
+  let inlinedCount = 0;
+  let failedCount = 0;
+  for (const turn of turns) {
+    for (const attachment of turn.attachments ?? []) {
+      attachmentCount += 1;
+      if (attachment.originalUrl.startsWith("data:")) {
+        inlinedCount += 1;
+      }
+      if (attachment.status === "failed") {
+        failedCount += 1;
+      }
+    }
+  }
+  return { attachmentCount, inlinedCount, failedCount };
+}
 
 export default defineContentScript({
   matches: ["https://chatgpt.com/*"],
@@ -110,38 +135,26 @@ export default defineContentScript({
             failed: estimatedAttachments
           });
         }
-        let attachmentCount = 0;
-        let inlinedCount = 0;
-        let failedCount = 0;
-        for (const turn of finalizedTurns) {
-          for (const attachment of turn.attachments ?? []) {
-            attachmentCount += 1;
-            if (attachment.originalUrl.startsWith("data:")) {
-              inlinedCount += 1;
-            }
-            if (attachment.status === "failed") {
-              failedCount += 1;
-            }
-          }
-        }
-        emitProgress("files", 100, failedCount > 0 ? `附件完成，失败 ${failedCount}` : "附件下载完成", {
-          processed: attachmentCount,
-          total: attachmentCount,
-          failed: failedCount
+
+        let summary = summarizeAttachments(finalizedTurns);
+        emitProgress("files", 100, summary.failedCount > 0 ? `附件完成，失败 ${summary.failedCount}` : "附件下载完成", {
+          processed: summary.attachmentCount,
+          total: summary.attachmentCount,
+          failed: summary.failedCount
         });
         console.info("[AI_HISTORY] chatgpt capture done", {
           turns: finalizedTurns.length,
-          attachments: attachmentCount,
-          inlined: inlinedCount,
-          failed: failedCount
+          attachments: summary.attachmentCount,
+          inlined: summary.inlinedCount,
+          failed: summary.failedCount
         });
         const warnings: string[] = [];
         if (attachmentStageError) {
           warnings.push(`附件阶段异常：${attachmentStageError}`);
         }
-        if (failedCount > 0) {
-          const successCount = Math.max(0, attachmentCount - failedCount);
-          warnings.push(`附件下载失败 ${failedCount} 个，成功 ${successCount} 个`);
+        if (summary.failedCount > 0) {
+          const successCount = Math.max(0, summary.attachmentCount - summary.failedCount);
+          warnings.push(`附件下载失败 ${summary.failedCount} 个，成功 ${successCount} 个`);
         }
         sendResponse({
           ok: true,

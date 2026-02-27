@@ -6,7 +6,7 @@ export default defineConfig({
   manifest: {
     name: "AI History Capture",
     description: "Capture ChatGPT/Gemini/AI Studio conversations directly into AI History desktop app",
-    permissions: ["tabs", "scripting", "activeTab", "storage"],
+    permissions: ["tabs", "scripting", "activeTab", "storage", "webRequest"],
     host_permissions: [
       "http://127.0.0.1:48765/*",
       "http://*/*",

@@ -256,23 +256,25 @@ export function FolderTree({ folders, selectedFolderId, onSelect, onDropConversa
         </div>
       </div>
       <div className="folder-controls">
-        <input
-          value={newFolderName}
-          onChange={(event) => setNewFolderName(event.target.value)}
-          placeholder="新建文件夹"
-        />
-        <button
-          onClick={() => {
-            const name = newFolderName.trim();
-            if (!name) {
-              return;
-            }
-            createFolder.mutate({ name, parentId: selectedFolderId });
-            setNewFolderName("");
-          }}
-        >
-          新建
-        </button>
+        <div className="folder-controls-group">
+          <input
+            value={newFolderName}
+            onChange={(event) => setNewFolderName(event.target.value)}
+            placeholder="新建文件夹"
+          />
+          <button
+            onClick={() => {
+              const name = newFolderName.trim();
+              if (!name) {
+                return;
+              }
+              createFolder.mutate({ name, parentId: selectedFolderId });
+              setNewFolderName("");
+            }}
+          >
+            新建
+          </button>
+        </div>
       </div>
       <div className={`folder-list ${draggingConversationId ? "dragging" : ""}`}>
         <div className={`folder-row ${selectedFolderId === null ? "active" : ""}`}>

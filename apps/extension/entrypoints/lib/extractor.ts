@@ -68,7 +68,7 @@ const FILE_LIKE_EXTENSIONS = [
 const MAX_INLINE_ATTACHMENT_BYTES = 64 * 1024 * 1024;
 const NETWORK_TRACKER_KEY = "__AI_HISTORY_NETWORK_TRACKER__";
 const MAX_TRACKED_NETWORK_RECORDS = 2400;
-const UUID_LIKE_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UUID_LIKE_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface TrackedNetworkRecord {
   url: string;
@@ -81,6 +81,7 @@ interface TrackedNetworkRecord {
 interface NetworkTrackerState {
   installed: boolean;
   records: TrackedNetworkRecord[];
+  inFlight: number;
 }
 
 type TrackerWindow = Window & {
@@ -116,7 +117,8 @@ function trackerState(): NetworkTrackerState {
   if (!globalWindow[NETWORK_TRACKER_KEY]) {
     globalWindow[NETWORK_TRACKER_KEY] = {
       installed: false,
-      records: []
+      records: [],
+      inFlight: 0
     };
   }
   return globalWindow[NETWORK_TRACKER_KEY]!;
@@ -134,6 +136,21 @@ function pushTrackedNetworkRecord(record: TrackedNetworkRecord): void {
   }
 }
 
+function incrementTrackedInFlight(): void {
+  const state = trackerState();
+  state.inFlight += 1;
+}
+
+function decrementTrackedInFlight(): void {
+  const state = trackerState();
+  state.inFlight = Math.max(0, state.inFlight - 1);
+}
+
+function getTrackedInFlightCount(): number {
+  ensureRuntimeNetworkTracker();
+  return trackerState().inFlight;
+}
+
 function ensureRuntimeNetworkTracker(): void {
   const state = trackerState();
   if (state.installed) {
@@ -148,6 +165,7 @@ function ensureRuntimeNetworkTracker(): void {
       .toString()
       .toUpperCase();
     const requestedUrl = resolveRequestUrl(input);
+    incrementTrackedInFlight();
     try {
       const response = await originalFetch(input, init);
       pushTrackedNetworkRecord({
@@ -167,6 +185,8 @@ function ensureRuntimeNetworkTracker(): void {
         ok: false
       });
       throw error;
+    } finally {
+      decrementTrackedInFlight();
     }
   }) as typeof window.fetch;
 
@@ -189,7 +209,13 @@ function ensureRuntimeNetworkTracker(): void {
   XMLHttpRequest.prototype.send = function patchedSend(body?: Document | XMLHttpRequestBodyInit | null): void {
     const self = this as XMLHttpRequest & { __aihMethod?: string; __aihUrl?: string };
     const startedAt = performance.now();
+    incrementTrackedInFlight();
+    let finalized = false;
     const finalize = () => {
+      if (finalized) {
+        return;
+      }
+      finalized = true;
       pushTrackedNetworkRecord({
         url: self.responseURL || self.__aihUrl || "",
         method: (self.__aihMethod || "GET").toUpperCase(),
@@ -197,11 +223,97 @@ function ensureRuntimeNetworkTracker(): void {
         status: Number(self.status || 0),
         ok: Number(self.status || 0) >= 200 && Number(self.status || 0) < 400
       });
+      decrementTrackedInFlight();
       self.removeEventListener("loadend", finalize);
     };
     self.addEventListener("loadend", finalize);
-    originalSend.call(this, body ?? null);
+    try {
+      originalSend.call(this, body ?? null);
+    } catch (error) {
+      finalize();
+      throw error;
+    }
   };
+
+  const captureNavigationLikeAttachmentUrl = (raw: unknown): void => {
+    if (typeof raw !== "string" && !(raw instanceof URL)) {
+      return;
+    }
+    const text = typeof raw === "string" ? raw : raw.toString();
+    const absolute = toAbsoluteUrl(text) || text;
+    if (!absolute || !isLikelyAttachmentUrl(absolute)) {
+      return;
+    }
+    pushTrackedNetworkRecord({
+      url: absolute,
+      method: "GET",
+      startedAt: performance.now(),
+      status: 200,
+      ok: true
+    });
+  };
+
+  try {
+    const originalWindowOpen = window.open.bind(window);
+    window.open = function patchedWindowOpen(
+      url?: string | URL,
+      target?: string,
+      features?: string
+    ): Window | null {
+      captureNavigationLikeAttachmentUrl(url ?? "");
+      return originalWindowOpen(url, target, features);
+    };
+  } catch {
+    // ignore
+  }
+
+  try {
+    const originalAnchorClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function patchedAnchorClick(this: HTMLAnchorElement): void {
+      captureNavigationLikeAttachmentUrl(this.href || this.getAttribute("href") || "");
+      originalAnchorClick.call(this);
+    };
+  } catch {
+    // ignore
+  }
+
+  try {
+    const originalAssign = Location.prototype.assign;
+    Location.prototype.assign = function patchedAssign(this: Location, url: string | URL): void {
+      captureNavigationLikeAttachmentUrl(url);
+      originalAssign.call(this, String(url));
+    };
+  } catch {
+    // ignore
+  }
+
+  try {
+    const originalReplace = Location.prototype.replace;
+    Location.prototype.replace = function patchedReplace(this: Location, url: string | URL): void {
+      captureNavigationLikeAttachmentUrl(url);
+      originalReplace.call(this, String(url));
+    };
+  } catch {
+    // ignore
+  }
+
+  try {
+    document.addEventListener(
+      "click",
+      (event) => {
+        const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+        for (const item of path) {
+          if (item instanceof HTMLAnchorElement) {
+            captureNavigationLikeAttachmentUrl(item.href || item.getAttribute("href") || "");
+            break;
+          }
+        }
+      },
+      true
+    );
+  } catch {
+    // ignore
+  }
 }
 
 function getTrackedNetworkRecords(sinceMs = 0): TrackedNetworkRecord[] {
@@ -565,6 +677,45 @@ function isDataUrl(url: string): boolean {
   return url.trim().toLowerCase().startsWith("data:");
 }
 
+function parseDataUrlName(url: string): string {
+  if (!isDataUrl(url)) {
+    return "";
+  }
+  const meta = url.trim().slice(5).split(",")[0] ?? "";
+  const parts = meta.split(";").map((part) => part.trim()).filter(Boolean);
+  for (const part of parts) {
+    if (!/^name=/i.test(part)) {
+      continue;
+    }
+    const raw = part.slice(5).trim().replace(/^["']+|["']+$/g, "");
+    if (!raw) {
+      continue;
+    }
+    try {
+      const decoded = decodeURIComponent(raw);
+      if (decoded) {
+        return decoded;
+      }
+    } catch {
+      // ignore decode failure and fallback to raw
+    }
+    return raw;
+  }
+  return "";
+}
+
+function dataUrlMime(url: string): string {
+  if (!isDataUrl(url)) {
+    return "";
+  }
+  const meta = url.trim().slice(5).split(",")[0] ?? "";
+  const mime = meta.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (!/^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(mime)) {
+    return "";
+  }
+  return mime;
+}
+
 function isVirtualAttachmentUrl(url: string): boolean {
   return url.trim().toLowerCase().startsWith("aihistory://upload/");
 }
@@ -583,6 +734,10 @@ function decodeVirtualAttachmentName(url: string): string {
   } catch {
     return raw;
   }
+}
+
+function buildVirtualAttachmentUrl(name: string): string {
+  return `aihistory://upload/${encodeURIComponent(name.trim())}`;
 }
 
 function stripGeminiBoilerplate(text: string): string {
@@ -611,6 +766,10 @@ function extractUrlExtension(url: string): string {
 }
 
 function looksLikePdfUrl(url: string): boolean {
+  const dataMime = dataUrlMime(url);
+  if (dataMime === "application/pdf") {
+    return true;
+  }
   const lower = url.toLowerCase();
   return lower.includes(".pdf") || lower.includes("format=pdf") || lower.includes("mime=application/pdf");
 }
@@ -627,6 +786,10 @@ function looksLikeCloudDriveFileUrl(url: string): boolean {
 }
 
 function looksLikeImageUrl(url: string): boolean {
+  const dataMime = dataUrlMime(url);
+  if (dataMime.startsWith("image/")) {
+    return true;
+  }
   const lower = url.toLowerCase();
   if (/\/backend-api\/estuary\/content/i.test(lower)) {
     return true;
@@ -687,7 +850,8 @@ function isLikelyOaiAttachmentUrl(url: string): boolean {
   if (
     /\/backend-api\/files\//i.test(lower) ||
     /\/(?:download|content|files?)\//i.test(lower) ||
-    /[?&](download|filename|attachment|response-content-disposition)=/i.test(lower)
+    /[?&](download|filename|attachment|response-content-disposition)=/i.test(lower) ||
+    /oaiusercontent\.com\/[^?#]*file[-_][a-z0-9-]{4,}/i.test(lower)
   ) {
     return true;
   }
@@ -695,7 +859,34 @@ function isLikelyOaiAttachmentUrl(url: string): boolean {
 }
 
 function inferAttachmentKind(url: string, label: string): CaptureAttachment["kind"] {
+  const dataMime = dataUrlMime(url);
+  if (dataMime === "application/pdf") {
+    return "pdf";
+  }
+  if (dataMime.startsWith("image/")) {
+    return "image";
+  }
   const lowerLabel = label.toLowerCase();
+  const lowerUrl = url.toLowerCase();
+  if (/\/backend-api\/estuary\/content/i.test(lowerUrl)) {
+    if (lowerLabel.includes(".pdf") || lowerLabel.includes("pdf") || lowerUrl.includes("format=pdf") || lowerUrl.includes("mime=application/pdf")) {
+      return "pdf";
+    }
+    if (
+      /\.(png|jpg|jpeg|webp|gif|bmp|svg)\b/i.test(lowerLabel) ||
+      lowerUrl.includes("format=png") ||
+      lowerUrl.includes("format=jpg") ||
+      lowerUrl.includes("format=jpeg") ||
+      lowerUrl.includes("format=webp") ||
+      lowerUrl.includes("format=gif") ||
+      lowerUrl.includes("format=bmp") ||
+      lowerUrl.includes("format=svg") ||
+      lowerUrl.includes("mime=image/")
+    ) {
+      return "image";
+    }
+    return "file";
+  }
   if (lowerLabel.includes(".pdf") || lowerLabel.includes("pdf") || looksLikePdfUrl(url)) {
     return "pdf";
   }
@@ -709,6 +900,10 @@ function inferAttachmentKind(url: string, label: string): CaptureAttachment["kin
 }
 
 function inferAttachmentMime(kind: CaptureAttachment["kind"], url: string): string | null {
+  const dataMime = dataUrlMime(url);
+  if (dataMime) {
+    return dataMime;
+  }
   if (kind === "pdf" || looksLikePdfUrl(url)) {
     return "application/pdf";
   }
@@ -749,6 +944,16 @@ function inferKindFromMimeHint(mimeHint: string | null | undefined): CaptureAtta
     return "image";
   }
   return null;
+}
+
+function attachmentKindScore(kind: CaptureAttachment["kind"]): number {
+  if (kind === "pdf") {
+    return 2;
+  }
+  if (kind === "image") {
+    return 1;
+  }
+  return 0;
 }
 
 function extractUrlsFromElement(node: Element): string[] {
@@ -929,6 +1134,73 @@ function pickChatGptConversationScroller(doc: Document): HTMLElement | null {
   return candidates[0] ?? null;
 }
 
+function collectChatGptConversationScrollers(doc: Document): HTMLElement[] {
+  const out: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  const add = (node: Element | null | undefined) => {
+    if (!(node instanceof HTMLElement)) {
+      return;
+    }
+    if (seen.has(node)) {
+      return;
+    }
+    if (node.scrollHeight - node.clientHeight < 60) {
+      return;
+    }
+    if (!isVisibleElement(node)) {
+      return;
+    }
+    if (node.closest("aside, nav, [role='navigation'], [role='complementary']")) {
+      return;
+    }
+    const hint = `${node.className || ""} ${node.getAttribute("data-testid") || ""}`.toLowerCase();
+    if (/sidebar|drawer|panel|composer|input|textarea|toolbar|modal/.test(hint)) {
+      return;
+    }
+    seen.add(node);
+    out.push(node);
+  };
+
+  add(pickChatGptConversationScroller(doc));
+  add(pickScrollableElement(doc));
+  add(doc.scrollingElement);
+  add(doc.querySelector("main"));
+
+  const main = doc.querySelector("main");
+  if (main instanceof HTMLElement) {
+    const messageNodes = Array.from(main.querySelectorAll("[data-message-author-role]"));
+    for (const messageNode of messageNodes.slice(0, 120)) {
+      let current: HTMLElement | null = messageNode instanceof HTMLElement ? messageNode : null;
+      let depth = 0;
+      while (current && depth < 14) {
+        add(current);
+        current = current.parentElement;
+        depth += 1;
+      }
+    }
+
+    const selectorCandidates = Array.from(
+      main.querySelectorAll(
+        [
+          "[data-testid*='conversation']",
+          "[data-testid*='thread']",
+          "[class*='conversation']",
+          "[class*='thread']",
+          "[class*='message']",
+          "[class*='overflow-y-auto']",
+          "[class*='scroll']"
+        ].join(",")
+      )
+    );
+    for (const node of selectorCandidates.slice(0, 180)) {
+      add(node);
+    }
+  }
+
+  out.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+  return out.slice(0, 6);
+}
+
 interface WarmupConfig {
   downSteps: number;
   downWaitMs: number;
@@ -998,6 +1270,279 @@ async function warmupScrollableArea(doc: Document, config: WarmupConfig): Promis
   await sleep(180);
 }
 
+interface SlowMoveResult {
+  startTop: number;
+  targetTop: number;
+  endTop: number;
+  maxTopSeen: number;
+  minTopSeen: number;
+  movedPixels: number;
+}
+
+async function moveScrollerSlowly(
+  scroller: HTMLElement,
+  fromTop: number,
+  toTop: number,
+  steps: number,
+  waitMs: number
+): Promise<SlowMoveResult> {
+  const totalSteps = Math.max(1, steps);
+  scroller.scrollTop = Math.round(fromTop);
+  scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+  await sleep(Math.max(24, Math.round(waitMs * 0.6)));
+  const actualStart = scroller.scrollTop;
+  let maxTopSeen = actualStart;
+  let minTopSeen = actualStart;
+  for (let index = 1; index <= totalSteps; index += 1) {
+    const ratio = index / totalSteps;
+    scroller.scrollTop = Math.round(fromTop + (toTop - fromTop) * ratio);
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await sleep(waitMs);
+    const currentTop = scroller.scrollTop;
+    if (currentTop > maxTopSeen) {
+      maxTopSeen = currentTop;
+    }
+    if (currentTop < minTopSeen) {
+      minTopSeen = currentTop;
+    }
+  }
+  const endTop = scroller.scrollTop;
+  const movedPixels = Math.max(Math.abs(maxTopSeen - actualStart), Math.abs(actualStart - minTopSeen), Math.abs(endTop - actualStart));
+  return {
+    startTop: actualStart,
+    targetTop: Math.round(toTop),
+    endTop,
+    maxTopSeen,
+    minTopSeen,
+    movedPixels
+  };
+}
+
+async function waitForTrackedNetworkSettle(idleRounds = 4, intervalMs = 240): Promise<void> {
+  ensureRuntimeNetworkTracker();
+  const windowStart = activeCaptureWindowStartMs();
+  let previousCount = getTrackedNetworkRecords(windowStart).length;
+  let stableRounds = 0;
+  for (let index = 0; index < 28; index += 1) {
+    await sleep(intervalMs);
+    const inFlight = getTrackedInFlightCount();
+    const currentCount = getTrackedNetworkRecords(windowStart).length;
+    if (inFlight === 0 && currentCount === previousCount) {
+      stableRounds += 1;
+      if (stableRounds >= idleRounds) {
+        return;
+      }
+    } else {
+      stableRounds = 0;
+      previousCount = currentCount;
+    }
+  }
+  console.info("[AI_HISTORY] network settle timeout", {
+    inFlight: getTrackedInFlightCount(),
+    records: getTrackedNetworkRecords(windowStart).length
+  });
+}
+
+async function sweepChatGptScrollerSlowly(
+  scroller: HTMLElement,
+  returnToOrigin = false
+): Promise<{ movedPixels: number; peakTop: number }> {
+  const originTop = Math.max(0, scroller.scrollTop);
+  const originMax = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  let movedPixels = 0;
+  let peakTop = originTop;
+  let floorTop = originTop;
+  console.info("[AI_HISTORY] chatgpt warmup sweep start", {
+    originTop,
+    maxScroll: originMax,
+    tag: scroller.tagName.toLowerCase(),
+    className: String(scroller.className || "").slice(0, 120)
+  });
+  const toTopSteps = Math.max(4, Math.min(18, Math.ceil(originTop / 260)));
+  if (originTop > 0) {
+    const moveUp = await moveScrollerSlowly(scroller, originTop, 0, toTopSteps, 90);
+    movedPixels = Math.max(movedPixels, moveUp.movedPixels);
+    peakTop = Math.max(peakTop, moveUp.maxTopSeen);
+    floorTop = Math.min(floorTop, moveUp.minTopSeen);
+    await sleep(180);
+  }
+
+  let reachedBottom = false;
+  for (let round = 0; round < 3; round += 1) {
+    const maxScrollBefore = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (maxScrollBefore < 24) {
+      break;
+    }
+    const downSteps = Math.max(10, Math.min(36, Math.ceil(maxScrollBefore / 320)));
+    const moveDown = await moveScrollerSlowly(scroller, scroller.scrollTop, maxScrollBefore, downSteps, 110);
+    movedPixels = Math.max(movedPixels, moveDown.movedPixels);
+    peakTop = Math.max(peakTop, moveDown.maxTopSeen);
+    floorTop = Math.min(floorTop, moveDown.minTopSeen);
+    await sleep(240);
+    const maxScrollAfter = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (Math.abs(maxScrollAfter - maxScrollBefore) <= 20) {
+      reachedBottom = true;
+      break;
+    }
+  }
+
+  const maxScrollFinal = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (maxScrollFinal >= 24) {
+    if (!reachedBottom) {
+      const finalDownSteps = Math.max(8, Math.min(28, Math.ceil(maxScrollFinal / 360)));
+      const finalDown = await moveScrollerSlowly(scroller, scroller.scrollTop, maxScrollFinal, finalDownSteps, 100);
+      movedPixels = Math.max(movedPixels, finalDown.movedPixels);
+      peakTop = Math.max(peakTop, finalDown.maxTopSeen);
+      floorTop = Math.min(floorTop, finalDown.minTopSeen);
+      await sleep(180);
+    }
+    const upSteps = Math.max(10, Math.min(36, Math.ceil(maxScrollFinal / 340)));
+    const upMove = await moveScrollerSlowly(scroller, scroller.scrollTop, 0, upSteps, 90);
+    movedPixels = Math.max(movedPixels, upMove.movedPixels);
+    peakTop = Math.max(peakTop, upMove.maxTopSeen);
+    floorTop = Math.min(floorTop, upMove.minTopSeen);
+    await sleep(180);
+  }
+
+  if (returnToOrigin) {
+    const latestMax = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    const cappedOrigin = Math.max(0, Math.min(latestMax, originTop));
+    const returnSteps = Math.max(4, Math.min(18, Math.ceil(Math.abs(cappedOrigin - scroller.scrollTop) / 260)));
+    const returnMove = await moveScrollerSlowly(scroller, scroller.scrollTop, cappedOrigin, returnSteps, 75);
+    movedPixels = Math.max(movedPixels, returnMove.movedPixels);
+    peakTop = Math.max(peakTop, returnMove.maxTopSeen);
+    floorTop = Math.min(floorTop, returnMove.minTopSeen);
+    await sleep(140);
+  } else {
+    if (scroller.scrollTop !== 0) {
+      const toTop = await moveScrollerSlowly(scroller, scroller.scrollTop, 0, Math.max(4, Math.ceil(scroller.scrollTop / 300)), 80);
+      movedPixels = Math.max(movedPixels, toTop.movedPixels);
+      peakTop = Math.max(peakTop, toTop.maxTopSeen);
+      floorTop = Math.min(floorTop, toTop.minTopSeen);
+    }
+    await sleep(180);
+  }
+  console.info("[AI_HISTORY] chatgpt warmup sweep done", {
+    restoredTop: scroller.scrollTop,
+    maxScroll: Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+    movedPixels,
+    peakTop,
+    floorTop
+  });
+  return {
+    movedPixels,
+    peakTop
+  };
+}
+
+function countExpectedNonImageUploadTiles(doc: Document = document): number {
+  const labels = collectChatGptFileTileButtons(doc)
+    .map((button) => (button.getAttribute("aria-label") || button.getAttribute("title") || "").trim().toLowerCase())
+    .filter(Boolean);
+  const unique = new Set<string>();
+  for (const label of labels) {
+    if (!looksLikeAttachmentFileNameLabel(label)) {
+      continue;
+    }
+    const ext = extractExtFromFileName(label);
+    if (!ext || isImageExtension(ext)) {
+      continue;
+    }
+    unique.add(label);
+  }
+  return unique.size;
+}
+
+function countTrackedNonImageDownloadHints(sinceMs = activeCaptureWindowStartMs()): number {
+  const seen = new Set<string>();
+  const add = (raw: string) => {
+    const url = (toAbsoluteUrl(raw) || raw).trim();
+    if (!url) {
+      return;
+    }
+    const lower = url.toLowerCase();
+    const isBackendDownload =
+      /\/backend-api\/files\/download\/[a-z0-9_-]{8,}/i.test(lower) ||
+      /\/backend-api\/files\/[a-z0-9_-]{8,}\/download/i.test(lower) ||
+      /\/backend-api\/estuary\/content\?[^#\s]*\bid=file[_-]/i.test(lower);
+    const isLikelyDirectOaiDownload =
+      lower.includes("oaiusercontent.com") &&
+      (
+        /[?&](download|filename|attachment|response-content-disposition)=/i.test(lower) ||
+        /oaiusercontent\.com\/[^?#]*file[-_][a-z0-9-]{4,}/i.test(lower) ||
+        /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|csv|txt)\b/i.test(lower)
+      );
+    if (!isBackendDownload && !isLikelyDirectOaiDownload) {
+      return;
+    }
+    seen.add(url);
+  };
+
+  const tracked = getTrackedNetworkRecords(sinceMs);
+  for (const record of tracked) {
+    if (record.method !== "GET" && record.method !== "POST") {
+      continue;
+    }
+    add(record.url);
+  }
+
+  try {
+    const resources = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+    for (const entry of resources.slice(-2200)) {
+      if (sinceMs > 0 && entry.startTime + 5 < sinceMs) {
+        continue;
+      }
+      add(String(entry.name || ""));
+    }
+  } catch {
+    // ignore
+  }
+
+  return seen.size;
+}
+
+async function waitForChatGptFileUrlEvidence(
+  doc: Document,
+  expectedNonImageUploads: number,
+  primedLabels: Set<string>,
+  preferredScroller: HTMLElement | null = null
+): Promise<void> {
+  if (expectedNonImageUploads <= 0) {
+    return;
+  }
+  const sinceMs = activeCaptureWindowStartMs();
+  const targetEvidence = Math.max(1, Math.min(expectedNonImageUploads, 2));
+  const scrollers = collectChatGptConversationScrollers(doc);
+  const mainScroller = preferredScroller && preferredScroller.isConnected
+    ? preferredScroller
+    : (scrollers[0] ?? null);
+  for (let round = 0; round < 8; round += 1) {
+    const observed = countTrackedNonImageDownloadHints(sinceMs);
+    if (observed >= targetEvidence) {
+      console.info("[AI_HISTORY] chatgpt warmup file-url evidence ready", {
+        observed,
+        targetEvidence,
+        expectedNonImageUploads
+      });
+      return;
+    }
+    if (mainScroller) {
+      mainScroller.scrollTop = 0;
+      mainScroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    } else {
+      window.scrollTo(0, 0);
+    }
+    await sleep(260);
+    await primeChatGptFileTileRequests(doc, primedLabels, 10, { nonImageOnly: true });
+    await waitForTrackedNetworkSettle(2, 280);
+  }
+  console.info("[AI_HISTORY] chatgpt warmup file-url evidence timeout", {
+    observed: countTrackedNonImageDownloadHints(sinceMs),
+    targetEvidence,
+    expectedNonImageUploads
+  });
+}
+
 function isVisibleElement(node: HTMLElement): boolean {
   if (!node.isConnected) {
     return false;
@@ -1046,7 +1591,7 @@ function collectChatGptFileTileButtons(doc: Document): HTMLButtonElement[] {
     }
   }
 
-  return out.slice(0, 6);
+  return out.slice(0, 12);
 }
 
 function dismissTransientAttachmentLayer(doc: Document): void {
@@ -1068,31 +1613,245 @@ function dismissTransientAttachmentLayer(doc: Document): void {
   doc.dispatchEvent(escapeUp);
 }
 
-async function primeChatGptFileTileRequests(doc: Document = document): Promise<void> {
+function createSyntheticReactEvent(
+  type: string,
+  target: HTMLElement,
+  nativeEvent: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const noop = () => undefined;
+  return {
+    type,
+    target,
+    currentTarget: target,
+    nativeEvent: {
+      type,
+      target,
+      currentTarget: target,
+      isTrusted: true,
+      ...nativeEvent
+    },
+    isTrusted: true,
+    button: 0,
+    buttons: 1,
+    detail: 1,
+    timeStamp: Date.now(),
+    defaultPrevented: false,
+    preventDefault: noop,
+    stopPropagation: noop,
+    persist: noop,
+    isDefaultPrevented: () => false,
+    isPropagationStopped: () => false
+  };
+}
+
+function invokeFunctionSafely(fn: unknown, eventLike: Record<string, unknown>): boolean {
+  if (typeof fn !== "function") {
+    return false;
+  }
+  try {
+    (fn as (event: Record<string, unknown>) => unknown)(eventLike);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function invokeReactHandlersFromProps(
+  props: unknown,
+  target: HTMLElement,
+  seenHandlers: Set<Function>
+): number {
+  if (!isRecord(props)) {
+    return 0;
+  }
+  const clickEvent = createSyntheticReactEvent("click", target);
+  const pointerEvent = createSyntheticReactEvent("pointerup", target, { pointerType: "mouse" });
+  const mouseEvent = createSyntheticReactEvent("mouseup", target, { button: 0 });
+  const keyEvent = createSyntheticReactEvent("keydown", target, { key: "Enter", code: "Enter" });
+  const handlerNames = [
+    "onPress",
+    "onClick",
+    "onPointerUp",
+    "onMouseUp",
+    "onMouseDown",
+    "onPointerDown",
+    "onKeyDown"
+  ];
+  let invoked = 0;
+  for (const key of handlerNames) {
+    const candidate = props[key];
+    if (typeof candidate !== "function") {
+      continue;
+    }
+    const fn = candidate as Function;
+    if (seenHandlers.has(fn)) {
+      continue;
+    }
+    seenHandlers.add(fn);
+    let eventLike = clickEvent;
+    if (key.toLowerCase().includes("pointer")) {
+      eventLike = pointerEvent;
+    } else if (key.toLowerCase().includes("mouse")) {
+      eventLike = mouseEvent;
+    } else if (key.toLowerCase().includes("key")) {
+      eventLike = keyEvent;
+    }
+    if (invokeFunctionSafely(fn, eventLike)) {
+      invoked += 1;
+    }
+  }
+  return invoked;
+}
+
+function invokeReactFileTileActions(node: HTMLElement): number {
+  let invoked = 0;
+  const seenHandlers = new Set<Function>();
+  let current: HTMLElement | null = node;
+  let depth = 0;
+  while (current && depth < 6) {
+    const names = ownPropertyNamesSafe(current as unknown as object);
+    for (const key of names) {
+      if (key.startsWith("__reactProps$")) {
+        const props = (current as unknown as Record<string, unknown>)[key];
+        invoked += invokeReactHandlersFromProps(props, node, seenHandlers);
+        continue;
+      }
+      if (!key.startsWith("__reactFiber$")) {
+        continue;
+      }
+      const fiber = (current as unknown as Record<string, unknown>)[key];
+      if (!isRecord(fiber)) {
+        continue;
+      }
+      invoked += invokeReactHandlersFromProps(fiber.memoizedProps, node, seenHandlers);
+      invoked += invokeReactHandlersFromProps(fiber.pendingProps, node, seenHandlers);
+      if (isRecord(fiber.return)) {
+        invoked += invokeReactHandlersFromProps(fiber.return.memoizedProps, node, seenHandlers);
+        invoked += invokeReactHandlersFromProps(fiber.return.pendingProps, node, seenHandlers);
+      }
+    }
+    current = current.parentElement;
+    depth += 1;
+  }
+  return invoked;
+}
+
+async function primeChatGptFileTileRequests(
+  doc: Document = document,
+  alreadyPrimedLabels: Set<string> | null = null,
+  maxClicks = 8,
+  options: {
+    nonImageOnly?: boolean;
+  } = {}
+): Promise<void> {
   ensureRuntimeNetworkTracker();
-  const buttons = collectChatGptFileTileButtons(doc);
+  const buttons = collectChatGptFileTileButtons(doc)
+    .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
   if (!buttons.length) {
     return;
   }
 
+  const primedLabels = alreadyPrimedLabels ?? new Set<string>();
+  const sinceMs = activeCaptureWindowStartMs();
+  let clicked = 0;
+  let attempted = 0;
+  let confirmed = 0;
+  let reactInvoked = 0;
   for (const button of buttons) {
     try {
+      const label = (button.getAttribute("aria-label") || button.getAttribute("title") || "").trim().toLowerCase();
+      if (label && primedLabels.has(label)) {
+        continue;
+      }
+      if (options.nonImageOnly && label) {
+        const ext = extractExtFromFileName(label);
+        if (!ext || isImageExtension(ext)) {
+          continue;
+        }
+      }
+      attempted += 1;
+      const hintsBefore = options.nonImageOnly ? countTrackedNonImageDownloadHints(sinceMs) : 0;
+      const clickTarget = (button.closest("[data-default-action='true']") as HTMLElement | null) ?? button;
       button.scrollIntoView({ block: "center", inline: "nearest" });
-      await sleep(60);
-      button.click();
-      await sleep(240);
-      dismissTransientAttachmentLayer(doc);
       await sleep(120);
+
+      const rect = clickTarget.getBoundingClientRect();
+      const clientX = Math.round(rect.left + Math.max(2, Math.min(rect.width - 2, rect.width / 2)));
+      const clientY = Math.round(rect.top + Math.max(2, Math.min(rect.height - 2, rect.height / 2)));
+      const pointerInit: PointerEventInit = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        pointerType: "mouse",
+        pointerId: 1,
+        isPrimary: true,
+        clientX,
+        clientY
+      };
+      if (typeof PointerEvent !== "undefined") {
+        clickTarget.dispatchEvent(new PointerEvent("pointerdown", { ...pointerInit, buttons: 1 }));
+        clickTarget.dispatchEvent(new PointerEvent("pointerup", { ...pointerInit, buttons: 0 }));
+      }
+      const mouseInit: MouseEventInit = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX,
+        clientY,
+        button: 0
+      };
+      clickTarget.dispatchEvent(new MouseEvent("mousedown", { ...mouseInit, buttons: 1 }));
+      clickTarget.dispatchEvent(new MouseEvent("mouseup", { ...mouseInit, buttons: 0 }));
+      clickTarget.dispatchEvent(new MouseEvent("click", { ...mouseInit, buttons: 0 }));
+      clickTarget.click();
+      if (clickTarget !== button) {
+        button.dispatchEvent(new MouseEvent("click", { ...mouseInit, buttons: 0 }));
+        button.click();
+      }
+      reactInvoked += invokeReactFileTileActions(clickTarget);
+      if (clickTarget !== button) {
+        reactInvoked += invokeReactFileTileActions(button);
+      }
+      clickTarget.focus({ preventScroll: true });
+      clickTarget.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+      clickTarget.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+
+      await sleep(560);
+      dismissTransientAttachmentLayer(doc);
+      await sleep(260);
+      let shouldMarkPrimed = true;
+      if (options.nonImageOnly) {
+        const hintsAfter = countTrackedNonImageDownloadHints(sinceMs);
+        shouldMarkPrimed = hintsAfter > hintsBefore;
+      }
+      if (label && shouldMarkPrimed) {
+        primedLabels.add(label);
+        confirmed += 1;
+      }
+      clicked += 1;
+      if (clicked >= Math.max(1, maxClicks)) {
+        break;
+      }
     } catch {
       // continue with next button
     }
+  }
+  if (attempted > 0) {
+    console.info("[AI_HISTORY] chatgpt warmup file-tile prime", {
+      nonImageOnly: Boolean(options.nonImageOnly),
+      attempted,
+      clicked,
+      confirmed,
+      primed: primedLabels.size,
+      reactInvoked
+    });
   }
 }
 
 async function warmupChatGptLazyResources(doc: Document = document): Promise<void> {
   ensureRuntimeNetworkTracker();
-  const scroller = pickChatGptConversationScroller(doc);
-  if (!scroller) {
+  const scrollers = collectChatGptConversationScrollers(doc);
+  if (scrollers.length === 0) {
     await warmupScrollableArea(doc, {
       downSteps: 16,
       downWaitMs: 90,
@@ -1102,58 +1861,52 @@ async function warmupChatGptLazyResources(doc: Document = document): Promise<voi
     return;
   }
 
-  const originTop = scroller.scrollTop;
-  const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-  if (maxScroll < 60) {
-    await sleep(120);
-    return;
+  const primedLabels = new Set<string>();
+  let activeScroller: HTMLElement | null = null;
+  for (const [index, scroller] of scrollers.entries()) {
+    const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+    if (maxScroll < 60) {
+      continue;
+    }
+    console.info("[AI_HISTORY] chatgpt warmup selected scroller", {
+      index,
+      maxScroll,
+      originTop: scroller.scrollTop,
+      tag: scroller.tagName.toLowerCase(),
+      className: String(scroller.className || "").slice(0, 120)
+    });
+    const originTop = Math.max(0, scroller.scrollTop);
+    const toTopSteps = Math.max(4, Math.min(24, Math.ceil(Math.max(originTop, maxScroll * 0.2) / 280)));
+    const moveToTop = await moveScrollerSlowly(scroller, originTop, 0, toTopSteps, 85);
+    await sleep(220);
+    if (moveToTop.movedPixels < 80 && maxScroll > 300) {
+      console.info("[AI_HISTORY] chatgpt warmup scroller ignored due to low movement", {
+        index,
+        movedPixels: moveToTop.movedPixels,
+        peakTop: moveToTop.maxTopSeen
+      });
+      continue;
+    }
+    activeScroller = scroller;
+    break;
   }
 
-  const startAt = Math.min(originTop + Math.max(0, Math.round(scroller.clientHeight * 0.6)), maxScroll);
-  const stepSize = Math.max(280, Math.round(scroller.clientHeight * 0.85));
-  const maxSteps = Math.min(46, Math.max(8, Math.ceil(maxScroll / stepSize)));
-
-  scroller.scrollTop = startAt;
-  scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-  await sleep(120);
-
-  let previousTop = scroller.scrollTop;
-  let stableRounds = 0;
-  for (let index = 0; index < maxSteps; index += 1) {
-    const target = Math.min(maxScroll, previousTop + stepSize);
-    if (Math.abs(target - previousTop) < 8) {
-      stableRounds += 1;
-    } else {
-      stableRounds = 0;
-    }
-    scroller.scrollTop = target;
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await sleep(130);
-    const currentTop = scroller.scrollTop;
-    if (Math.abs(currentTop - previousTop) < 6) {
-      stableRounds += 1;
-    } else {
-      stableRounds = 0;
-    }
-    previousTop = currentTop;
-    if (maxScroll - currentTop <= 12 || stableRounds >= 3) {
-      break;
-    }
+  if (!activeScroller) {
+    await warmupScrollableArea(doc, {
+      downSteps: 16,
+      downWaitMs: 90,
+      upWaitMs: 55
+    });
+    await primeChatGptFileTileRequests(doc, primedLabels, 10, { nonImageOnly: true });
+  } else {
+    activeScroller.scrollTop = 0;
+    activeScroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await sleep(260);
+    await primeChatGptFileTileRequests(doc, primedLabels, 10, { nonImageOnly: true });
   }
-
-  await sleep(180);
-  const returnSteps = 7;
-  const currentTop = scroller.scrollTop;
-  for (let i = returnSteps; i >= 0; i -= 1) {
-    scroller.scrollTop = Math.round(originTop + (currentTop - originTop) * (i / returnSteps));
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await sleep(65);
-  }
-
-  scroller.scrollTop = originTop;
-  scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-  await sleep(180);
-  await primeChatGptFileTileRequests(doc);
+  const expectedNonImageUploads = countExpectedNonImageUploadTiles(doc);
+  await waitForChatGptFileUrlEvidence(doc, expectedNonImageUploads, primedLabels, activeScroller);
+  await waitForTrackedNetworkSettle(3, 260);
 }
 
 export async function warmupAiStudioLazyResources(doc: Document = document): Promise<void> {
@@ -1361,7 +2114,7 @@ function extractAttachments(node: ParentNode): CaptureAttachment[] {
         looksLikeOpaqueFileId(raw)
       ) {
         const allowUuid = /\/backend-api\/estuary\/content|\/backend-api\/files\//i.test(raw);
-        addFileIdCandidates(raw, null, { allowUuid });
+        addFileIdCandidates(raw, null, { allowUuid, sourceKey: attrName });
       }
     }
     addFileIdCandidates(label, null);
@@ -1388,6 +2141,10 @@ function extractAttachments(node: ParentNode): CaptureAttachment[] {
     if (!looksLikeAttachmentFileNameLabel(label)) {
       continue;
     }
+    const labelKind = inferAttachmentKind("", label);
+    const labelMimeHint = inferAttachmentMime(labelKind, label);
+    const labelExt = extractExtFromFileName(label);
+    const allowLabelUuid = Boolean(labelExt) && !isImageExtension(labelExt);
 
     const scopes: Element[] = [];
     let current: Element | null = fileLabelNode;
@@ -1418,17 +2175,57 @@ function extractAttachments(node: ParentNode): CaptureAttachment[] {
           /\/backend-api\/estuary\/content/i.test(raw) ||
           looksLikeOpaqueFileId(raw)
         ) {
-          const allowUuid = /\/backend-api\/estuary\/content|\/backend-api\/files\//i.test(raw);
-          addFileIdCandidates(raw, null, { allowUuid });
+          const allowUuid = /\/backend-api\/estuary\/content|\/backend-api\/files\//i.test(raw) || allowLabelUuid;
+          addFileIdCandidates(raw, labelMimeHint, { allowUuid, sourceKey: attrName });
         }
       }
       const scopeText = ((scope as HTMLElement).innerText || scope.textContent || "").trim();
       if (scopeText && (looksLikeAttachmentFileNameLabel(scopeText) || /file[-_]|backend-api|estuary|download/i.test(scopeText))) {
-        addFileIdCandidates(scopeText, null, { allowUuid: /backend-api|estuary/i.test(scopeText) });
+        addFileIdCandidates(scopeText, labelMimeHint, {
+          allowUuid: /backend-api|estuary/i.test(scopeText) || allowLabelUuid
+        });
       }
     }
 
-    addFileIdCandidates(label, null);
+    addFileIdCandidates(label, labelMimeHint, { allowUuid: allowLabelUuid });
+
+    // Deep React fiber traversal: ChatGPT's file-tile buttons often have the
+    // real file_id buried deep in React's internal component tree, not
+    // exposed in DOM attributes. Walk up to 10 DOM levels and 10 fiber
+    // parents to find file-service:// URIs, file-xxx IDs, and backend-api URLs.
+    const fiberFileIds = extractFileIdsFromFileTileReactFiber(fileLabelNode);
+    if (fiberFileIds.length > 0) {
+      const mimeHint = labelMimeHint;
+      for (const rawId of fiberFileIds) {
+        // If rawId is already a full URL, add it directly
+        if (/^https?:\/\//i.test(rawId) || /\/backend-api\//i.test(rawId)) {
+          addAttachmentCandidate(found, rawId, mimeHint, label);
+        } else {
+          // It's a file ID — build backend URL candidates
+          for (const candidate of buildBackendFileUrlCandidates(rawId, contextPostIds, contextConversationIds)) {
+            addAttachmentCandidate(found, candidate, mimeHint, label);
+          }
+        }
+      }
+      console.info("[AI_HISTORY] file-tile react fiber extraction", {
+        label,
+        ids: fiberFileIds.slice(0, 4)
+      });
+    }
+
+    const ext = extractExtFromFileName(label);
+    if (ext && !isImageExtension(ext)) {
+      const virtualUrl = buildVirtualAttachmentUrl(label);
+      if (!found.has(virtualUrl)) {
+        const virtualKind: CaptureAttachment["kind"] = ext === "pdf" ? "pdf" : "file";
+        found.set(virtualUrl, {
+          kind: virtualKind,
+          originalUrl: virtualUrl,
+          mime: inferAttachmentMime(virtualKind, label),
+          status: "remote_only"
+        });
+      }
+    }
   }
 
   const fileIdNodes = Array.from(
@@ -1451,7 +2248,7 @@ function extractAttachments(node: ParentNode): CaptureAttachment[] {
       if (!raw) {
         continue;
       }
-      addFileIdCandidates(raw, null, { allowUuid: true });
+      addFileIdCandidates(raw, null, { allowUuid: true, sourceKey: attrName });
     }
     const text = ((fileNode as HTMLElement).innerText || fileNode.textContent || "").trim();
     if (text) {
@@ -1977,6 +2774,7 @@ function attachmentMatchesInlineFileNames(attachment: CaptureAttachment, fileNam
     return false;
   }
   const attachmentName = attachmentDisplayName(attachment).trim().toLowerCase();
+  const attachmentStem = attachmentName.replace(/\.[a-z0-9]{1,10}$/i, "");
   const attachmentMime = (attachment.mime || "").toLowerCase();
   const attachmentExt = extractExtFromFileName(attachment.originalUrl);
   for (const name of fileNames) {
@@ -1987,6 +2785,10 @@ function attachmentMatchesInlineFileNames(attachment: CaptureAttachment, fileNam
     const ext = extractExtFromFileName(name);
     if (!ext) {
       continue;
+    }
+    const nameStem = normalizedName.replace(/\.[a-z0-9]{1,10}$/i, "");
+    if (nameStem && attachmentStem && nameStem === attachmentStem) {
+      return true;
     }
     if (
       ext === "pdf" &&
@@ -2000,14 +2802,31 @@ function attachmentMatchesInlineFileNames(attachment: CaptureAttachment, fileNam
     ) {
       return true;
     }
-    if (!isImageExtension(ext) && ext !== "pdf" && attachment.kind === "file") {
-      return true;
-    }
-    if (attachmentExt && attachmentExt === ext) {
+    if (!isImageExtension(ext) && ext !== "pdf" && attachmentExt && attachmentExt === ext && Boolean(attachmentName)) {
       return true;
     }
   }
   return false;
+}
+
+function collectTurnInlineFileNameHints(turn: CaptureTurn): string[] {
+  const out = new Set<string>();
+  for (const name of findLikelyInlineFileNames(turn.contentMarkdown || "")) {
+    const normalized = name.trim();
+    if (normalized) {
+      out.add(normalized);
+    }
+  }
+  for (const attachment of turn.attachments ?? []) {
+    if (!isVirtualAttachmentUrl(attachment.originalUrl)) {
+      continue;
+    }
+    const virtualName = attachmentDisplayName(attachment).trim();
+    if (virtualName && looksLikeAttachmentFileNameLabel(virtualName)) {
+      out.add(virtualName);
+    }
+  }
+  return Array.from(out);
 }
 
 function applyChatGptResourceAttachmentFallback(
@@ -2023,16 +2842,52 @@ function applyChatGptResourceAttachmentFallback(
     return turns;
   }
 
+  const semanticKey = (attachment: CaptureAttachment): string => {
+    const raw = attachment.originalUrl.trim();
+    if (!raw) {
+      return "";
+    }
+    const fileId =
+      extractBackendFileIdFromUrl(raw) ||
+      extractEstuaryFileIdFromUrl(raw) ||
+      maybeFileIdFromString(raw, { allowUuid: true, sourceKey: "file_id" });
+    if (fileId) {
+      return `fileid:${fileId.toLowerCase()}`;
+    }
+    if (isDataUrl(raw)) {
+      return `data:${raw.slice(0, 128)}`;
+    }
+    return `url:${raw}`;
+  };
+
   const existing = new Set<string>();
+  const existingSemantic = new Set<string>();
   for (const turn of turns) {
     for (const attachment of turn.attachments ?? []) {
-      existing.add(attachment.originalUrl.trim());
+      const raw = attachment.originalUrl.trim();
+      if (raw) {
+        existing.add(raw);
+      }
+      const semantic = semanticKey(attachment);
+      if (semantic) {
+        existingSemantic.add(semantic);
+      }
     }
   }
 
   const pool = resourceAttachments.filter((attachment) => {
+    if (attachment.kind === "image") {
+      return false;
+    }
     const key = attachment.originalUrl.trim();
-    return Boolean(key) && !existing.has(key);
+    if (!key || existing.has(key)) {
+      return false;
+    }
+    const semantic = semanticKey(attachment);
+    if (semantic && existingSemantic.has(semantic)) {
+      return false;
+    }
+    return true;
   });
   if (!pool.length) {
     return turns;
@@ -2073,10 +2928,11 @@ function applyChatGptResourceAttachmentFallback(
     if (!target) {
       continue;
     }
-    const names = findLikelyInlineFileNames(target.contentMarkdown || "");
-    const matched = names.length > 0
-      ? remaining.filter((attachment) => attachmentMatchesInlineFileNames(attachment, names))
-      : remaining.slice();
+    const names = collectTurnInlineFileNameHints(target);
+    if (!names.length) {
+      continue;
+    }
+    const matched = remaining.filter((attachment) => attachmentMatchesInlineFileNames(attachment, names));
     if (!matched.length) {
       continue;
     }
@@ -2160,7 +3016,7 @@ function normalizeLikelyPostId(raw: string): string | null {
   if (!trimmed || /^file[-_]/i.test(trimmed)) {
     return null;
   }
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)) {
+  if (UUID_LIKE_REGEX.test(trimmed)) {
     return trimmed;
   }
   if (/^msg_[a-z0-9_-]{6,}$/i.test(trimmed)) {
@@ -2177,13 +3033,55 @@ function normalizeLikelyConversationId(raw: string): string | null {
   if (!trimmed) {
     return null;
   }
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(trimmed)) {
+  if (UUID_LIKE_REGEX.test(trimmed)) {
     return trimmed;
   }
   if (/^[a-z0-9][a-z0-9_-]{20,}$/i.test(trimmed) && !trimmed.includes(".")) {
     return trimmed;
   }
   return null;
+}
+
+function isLikelyConversationOnlyUuid(rawId: string, conversationIds: string[] = []): boolean {
+  const trimmed = rawId.trim();
+  if (!UUID_LIKE_REGEX.test(trimmed)) {
+    return false;
+  }
+  const lower = trimmed.toLowerCase();
+  if (conversationIds.some((id) => id.trim().toLowerCase() === lower)) {
+    return true;
+  }
+  const currentConversationId = parseChatGptConversationId(document.location.href || "");
+  if (currentConversationId && currentConversationId.toLowerCase() === lower) {
+    return true;
+  }
+
+  const escaped = trimmed.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const matcher = new RegExp(
+    `(?:/backend-api/conversation(?:s)?/${escaped}(?:[/?#]|$)|(?:conversation[_-]?id|ck_context_scopes_for_conversation_id|context_conversation_id)=${escaped}(?:[&#]|$))`,
+    "i"
+  );
+
+  const tracked = getTrackedNetworkRecords(0);
+  for (const record of tracked.slice(-1000)) {
+    if (matcher.test(record.url || "")) {
+      return true;
+    }
+  }
+
+  try {
+    const resources = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+    for (const entry of resources.slice(-1000)) {
+      const name = String(entry.name || "");
+      if (matcher.test(name)) {
+        return true;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  return false;
 }
 
 function extractLikelyPostIdsFromString(raw: string): string[] {
@@ -2436,6 +3334,64 @@ function collectLikelyConversationIdsFromDocument(doc: Document = document): str
   return ids;
 }
 
+function sourceKeySuggestsFileIdentity(sourceKey: string): boolean {
+  const lower = sourceKey.trim().toLowerCase();
+  if (!lower) {
+    return false;
+  }
+  return (
+    /(^|_)(file|asset|attachment|upload|document|pointer|blob)(_|$)/i.test(lower) ||
+    /(file|asset|attachment|upload|document|pointer|blob)[_-]?id$/i.test(lower)
+  );
+}
+
+function sourceKeySuggestsConversationIdentity(sourceKey: string): boolean {
+  const lower = sourceKey.trim().toLowerCase();
+  if (!lower) {
+    return false;
+  }
+  return /(conversation|context|scope|thread|session|dialog|chat)/i.test(lower);
+}
+
+function hasFileIdSignalInRawText(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  return (
+    /file-service:\/\//i.test(lower) ||
+    /\/backend-api\/files\//i.test(lower) ||
+    /\/backend-api\/estuary\/content/i.test(lower) ||
+    /(?:^|[?&])(file_id|fileid)=/i.test(lower) ||
+    /\b(file|asset|attachment|upload|document|pointer)[_-]?id\b/i.test(lower)
+  );
+}
+
+function hasConversationIdSignalInRawText(raw: string): boolean {
+  const lower = raw.toLowerCase();
+  return (
+    /\/backend-api\/conversation(s)?\//i.test(lower) ||
+    /(?:^|[?&])(conversation_id|conversationid|context_conversation_id|ck_context_scopes_for_conversation_id)=/i.test(lower) ||
+    /\b(conversation|context|scope|thread)[_-]?id\b/i.test(lower)
+  );
+}
+
+function shouldAllowUuidAsFileId(raw: string, options: ExtractFileIdOptions = {}): boolean {
+  if (options.allowUuid !== true) {
+    return false;
+  }
+  const sourceKey = (options.sourceKey || "").trim();
+  if (sourceKeySuggestsConversationIdentity(sourceKey)) {
+    return false;
+  }
+  if (sourceKeySuggestsFileIdentity(sourceKey)) {
+    return true;
+  }
+  const hasFileSignal = hasFileIdSignalInRawText(raw);
+  const hasConversationSignal = hasConversationIdSignalInRawText(raw);
+  if (hasConversationSignal && !hasFileSignal) {
+    return false;
+  }
+  return hasFileSignal;
+}
+
 function looksLikeOpaqueFileId(raw: string): boolean {
   const trimmed = raw.trim();
   if (!trimmed || trimmed.length < 8 || trimmed.length > 128) {
@@ -2459,8 +3415,149 @@ function looksLikeOpaqueFileId(raw: string): boolean {
   return false;
 }
 
+/**
+ * Deeply traverse React fiber tree starting from a file-tile DOM element to
+ * extract file IDs, file-service:// URIs, and download URLs that ChatGPT
+ * buries inside its component props. Returns found attachment candidates.
+ */
+function extractFileIdsFromFileTileReactFiber(element: Element): string[] {
+  const fileIds = new Set<string>();
+  const visited = new Set<object>();
+  let objectCount = 0;
+  const MAX_OBJECTS = 1800;
+
+  const scanValue = (value: unknown, depth: number, sourceKey = ""): void => {
+    if (depth > 12 || objectCount > MAX_OBJECTS) {
+      return;
+    }
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return;
+      }
+      if (/^https?:\/\//i.test(trimmed)) {
+        const lower = trimmed.toLowerCase();
+        if (
+          isLikelyOaiAttachmentUrl(lower) ||
+          looksLikeFileUrl(lower) ||
+          /\/backend-api\/(files|estuary\/content)/i.test(lower)
+        ) {
+          fileIds.add(trimmed);
+        }
+      }
+      for (const extractedId of extractFileIdsFromString(trimmed, { allowUuid: true, sourceKey })) {
+        fileIds.add(extractedId);
+      }
+      // file-service:// URIs directly contain the file ID
+      if (/^file-service:\/\//i.test(trimmed)) {
+        const id = trimmed.replace(/^file-service:\/\//i, "").split(/[?#]/)[0]?.trim();
+        if (id && id.length >= 8) {
+          fileIds.add(id);
+        }
+        return;
+      }
+      // backend-api URLs
+      if (/\/backend-api\/(files|estuary\/content)/i.test(trimmed)) {
+        fileIds.add(trimmed);
+        return;
+      }
+      // Opaque file IDs (file-xxx, gizmo-xxx, etc.)
+      if (/^file[-_][a-z0-9-]{6,}$/i.test(trimmed) || /^gizmo[-_][a-z0-9-]{6,}$/i.test(trimmed)) {
+        fileIds.add(trimmed);
+        return;
+      }
+      // Long hex hashes that look like file IDs
+      if (/^[a-f0-9]{24,64}$/i.test(trimmed)) {
+        fileIds.add(trimmed);
+        return;
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        scanValue(item, depth + 1, sourceKey);
+      }
+      return;
+    }
+    if (value && typeof value === "object") {
+      if (visited.has(value)) {
+        return;
+      }
+      visited.add(value);
+      objectCount += 1;
+      const record = value as Record<string, unknown>;
+      for (const key of Object.keys(record)) {
+        const lower = key.toLowerCase();
+        // Descend broadly near the top, then narrow to file/attachment-like branches.
+        const shouldDescend =
+          depth <= 2 ||
+          /(file|asset|attachment|upload|document|pointer|download|content|id|url|href|src|name|mime|blob|metadata)/i.test(lower) ||
+          lower === "children" ||
+          lower === "props" ||
+          lower === "memoizedProps" ||
+          lower === "pendingProps" ||
+          lower === "stateNode";
+        if (shouldDescend) {
+          scanValue(record[key], depth + 1, key);
+        }
+      }
+    }
+  };
+
+  // Walk up the DOM and into React fiber trees
+  let current: Element | null = element;
+  let domDepth = 0;
+  while (current && domDepth < 14) {
+    try {
+      const names = ownPropertyNamesSafe(current as unknown as object);
+      for (const key of names) {
+        if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) {
+          let fiber = (current as unknown as Record<string, unknown>)[key] as Record<string, unknown> | null;
+          // Walk up multiple fiber parents to catch deeply nested file props.
+          let fiberDepth = 0;
+          while (fiber && fiberDepth < 16 && objectCount < MAX_OBJECTS) {
+            if (!isRecord(fiber)) {
+              break;
+            }
+            if (!visited.has(fiber)) {
+              visited.add(fiber);
+              objectCount += 1;
+              // Scan memoizedProps and pendingProps
+              if (isRecord(fiber.memoizedProps)) {
+                scanValue(fiber.memoizedProps, 0);
+              }
+              if (isRecord(fiber.pendingProps)) {
+                scanValue(fiber.pendingProps, 0);
+              }
+              // Also check stateNode
+              if (isRecord(fiber.stateNode) && !visited.has(fiber.stateNode)) {
+                scanValue(fiber.stateNode, 2);
+              }
+            }
+            fiber = fiber.return as Record<string, unknown> | null;
+            fiberDepth += 1;
+          }
+        }
+        if (key.startsWith("__reactProps$")) {
+          const props = (current as unknown as Record<string, unknown>)[key];
+          if (isRecord(props)) {
+            scanValue(props, 0);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+    current = current.parentElement;
+    domDepth += 1;
+  }
+
+  return Array.from(fileIds);
+}
+
 interface ExtractFileIdOptions {
   allowUuid?: boolean;
+  sourceKey?: string;
 }
 
 function extractFileIdsFromString(raw: string, options: ExtractFileIdOptions = {}): string[] {
@@ -2469,14 +3566,19 @@ function extractFileIdsFromString(raw: string, options: ExtractFileIdOptions = {
   if (!trimmed) {
     return [];
   }
-  const allowUuid = options.allowUuid === true;
+  const allowUuidByContext = shouldAllowUuidAsFileId(trimmed, options);
 
   const add = (value: string) => {
     const decoded = safeDecodeURIComponent(value.trim());
     if (!decoded) {
       return;
     }
-    if (!looksLikeOpaqueFileId(decoded) && !(allowUuid && UUID_LIKE_REGEX.test(decoded))) {
+    const isOpaqueId = looksLikeOpaqueFileId(decoded);
+    const isUuid = UUID_LIKE_REGEX.test(decoded);
+    if (!isOpaqueId && !(allowUuidByContext && isUuid)) {
+      return;
+    }
+    if (isUuid && !isOpaqueId && isLikelyConversationOnlyUuid(decoded)) {
       return;
     }
     out.add(decoded);
@@ -2511,7 +3613,15 @@ function extractFileIdsFromString(raw: string, options: ExtractFileIdOptions = {
     }
   }
 
-  if (looksLikeOpaqueFileId(trimmed) || (allowUuid && UUID_LIKE_REGEX.test(trimmed))) {
+  if (allowUuidByContext) {
+    for (const match of trimmed.matchAll(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi)) {
+      if (match[0]) {
+        add(match[0]);
+      }
+    }
+  }
+
+  if (looksLikeOpaqueFileId(trimmed) || (allowUuidByContext && UUID_LIKE_REGEX.test(trimmed))) {
     add(trimmed);
   }
 
@@ -2531,30 +3641,65 @@ function buildBackendFileUrlCandidates(
   if (!normalized) {
     return [];
   }
+  const normalizedPostIds = postIds
+    .map((raw) => normalizeLikelyPostId(raw))
+    .filter((item): item is string => Boolean(item))
+    .slice(0, 6);
+  const normalizedConversationIds = conversationIds
+    .map((raw) => normalizeLikelyConversationId(raw))
+    .filter((item): item is string => Boolean(item))
+    .slice(0, 6);
+  if (isLikelyConversationOnlyUuid(normalized, normalizedConversationIds)) {
+    return [];
+  }
   const encoded = encodeURIComponent(normalized);
-  const normalizedPostId = postIds
-    .map((raw) => normalizeLikelyPostId(raw) || "")
-    .find(Boolean);
-  const normalizedConversationId = conversationIds
-    .map((raw) => normalizeLikelyConversationId(raw) || "")
-    .find(Boolean);
   const rawCandidates = [
     `/backend-api/estuary/content?id=${encoded}`,
+    `/backend-api/estuary/content?id=${encoded}&v=0`,
+    `/backend-api/estuary/content?id=${encoded}&v=1`,
     `/backend-api/files/download/${encoded}`,
     `/backend-api/files/${encoded}/download`,
     `/backend-api/files/${encoded}`,
     `/backend-api/files/${encoded}/content`
   ];
-  if (normalizedPostId) {
-    const encodedPostId = encodeURIComponent(normalizedPostId);
+  for (const postId of normalizedPostIds) {
+    const encodedPostId = encodeURIComponent(postId);
     rawCandidates.push(`/backend-api/files/download/${encoded}?post_id=${encodedPostId}`);
+    rawCandidates.push(
+      `/backend-api/estuary/content?id=${encoded}&post_id=${encodedPostId}`,
+      `/backend-api/estuary/content?id=${encoded}&post_id=${encodedPostId}&v=0`
+    );
   }
-  if (normalizedConversationId) {
-    const encodedConversationId = encodeURIComponent(normalizedConversationId);
+  for (const conversationId of normalizedConversationIds) {
+    const encodedConversationId = encodeURIComponent(conversationId);
     rawCandidates.push(
       `/backend-api/files/download/${encoded}?conversation_id=${encodedConversationId}`,
-      `/backend-api/files/download/${encoded}?ck_context_scopes_for_conversation_id=${encodedConversationId}`
+      `/backend-api/files/download/${encoded}?ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+      `/backend-api/files/${encoded}/download?conversation_id=${encodedConversationId}`,
+      `/backend-api/files/${encoded}/download?ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+      `/backend-api/files/${encoded}?conversation_id=${encodedConversationId}`,
+      `/backend-api/files/${encoded}?ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+      `/backend-api/estuary/content?id=${encoded}&conversation_id=${encodedConversationId}`,
+      `/backend-api/estuary/content?id=${encoded}&ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+      `/backend-api/estuary/content?id=${encoded}&conversation_id=${encodedConversationId}&v=0`,
+      `/backend-api/estuary/content?id=${encoded}&ck_context_scopes_for_conversation_id=${encodedConversationId}&v=0`
     );
+  }
+  for (const postId of normalizedPostIds) {
+    for (const conversationId of normalizedConversationIds.slice(0, 3)) {
+      const encodedPostId = encodeURIComponent(postId);
+      const encodedConversationId = encodeURIComponent(conversationId);
+      rawCandidates.push(
+        `/backend-api/files/download/${encoded}?post_id=${encodedPostId}&conversation_id=${encodedConversationId}`,
+        `/backend-api/files/download/${encoded}?post_id=${encodedPostId}&ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+        `/backend-api/files/${encoded}/download?post_id=${encodedPostId}&conversation_id=${encodedConversationId}`,
+        `/backend-api/files/${encoded}/download?post_id=${encodedPostId}&ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+        `/backend-api/files/${encoded}?post_id=${encodedPostId}&conversation_id=${encodedConversationId}`,
+        `/backend-api/files/${encoded}?post_id=${encodedPostId}&ck_context_scopes_for_conversation_id=${encodedConversationId}`,
+        `/backend-api/estuary/content?id=${encoded}&post_id=${encodedPostId}&conversation_id=${encodedConversationId}&v=0`,
+        `/backend-api/estuary/content?id=${encoded}&post_id=${encodedPostId}&ck_context_scopes_for_conversation_id=${encodedConversationId}&v=0`
+      );
+    }
   }
   const out: string[] = [];
   const seen = new Set<string>();
@@ -2619,17 +3764,36 @@ function addAttachmentCandidate(
     !looksLikeFileUrl(absolute) &&
     !absolute.startsWith("blob:") &&
     !absolute.startsWith("data:") &&
-    !isBackendFile
+    !isBackendFile &&
+    !isLikelyOaiAttachmentUrl(lowerAbsolute)
   ) {
     return;
   }
+  const nextMime = mimeHint || inferAttachmentMime(kind, absolute);
   if (found.has(absolute)) {
+    const previous = found.get(absolute)!;
+    const previousScore = attachmentKindScore(previous.kind);
+    const nextScore = attachmentKindScore(kind);
+    if (nextScore > previousScore) {
+      found.set(absolute, {
+        ...previous,
+        kind,
+        mime: previous.mime || nextMime
+      });
+      return;
+    }
+    if (!previous.mime && nextMime) {
+      found.set(absolute, {
+        ...previous,
+        mime: nextMime
+      });
+    }
     return;
   }
   found.set(absolute, {
     kind,
     originalUrl: absolute,
-    mime: mimeHint || inferAttachmentMime(kind, absolute),
+    mime: nextMime,
     status: "remote_only"
   });
 }
@@ -2666,9 +3830,12 @@ function extractAttachmentsFromApiMessage(
     );
 
     let localMime: string | null = null;
+    let localName: string = "";
     const localFileIds = new Set<string>();
     const localPostIds = new Set<string>();
     const localConversationIds = new Set<string>();
+    const localUrls = new Set<string>();
+
     for (const [key, value] of Object.entries(node)) {
       if (typeof value === "string") {
         const trimmed = value.trim();
@@ -2678,6 +3845,10 @@ function extractAttachmentsFromApiMessage(
 
         if (/mime|content[_-]?type/i.test(key) && /^[a-z0-9.+-]+\/[a-z0-9.+-]+/i.test(trimmed)) {
           localMime = trimmed.split(";")[0]?.trim().toLowerCase() ?? null;
+        }
+
+        if (/(^|_)(name|filename|title)$/i.test(key) || key === "name") {
+          localName = trimmed;
         }
 
         if (/post[_-]?id|message[_-]?id|node[_-]?id|turn[_-]?id|id/i.test(key)) {
@@ -2692,20 +3863,20 @@ function extractAttachmentsFromApiMessage(
         }
 
         if (isLikelyAttachmentUrl(trimmed)) {
-          addAttachmentCandidate(found, trimmed, localMime);
+          localUrls.add(trimmed);
         }
 
         const keySuggestsFile =
           /(^|_)(file|asset|attachment|upload|document|pointer|blob)(_|$)/i.test(key) ||
           /(file|asset|attachment|upload|document)[_-]?id$/i.test(key);
         const allowUuid = keySuggestsFile || (nodeLooksLikeAttachmentRecord && /(^id$|[_-]id$)/i.test(key));
-        const ids = extractFileIdsFromString(trimmed, { allowUuid });
+        const ids = extractFileIdsFromString(trimmed, { allowUuid, sourceKey: key });
         if (ids.length > 0 && (keySuggestsFile || allowUuid || looksLikeOpaqueFileId(trimmed) || /file-service:\/\//i.test(trimmed))) {
           for (const id of ids) {
             localFileIds.add(id);
           }
         } else {
-          const inlineId = maybeFileIdFromString(trimmed, { allowUuid });
+          const inlineId = maybeFileIdFromString(trimmed, { allowUuid, sourceKey: key });
           if (inlineId) {
             localFileIds.add(inlineId);
           }
@@ -2715,13 +3886,17 @@ function extractAttachmentsFromApiMessage(
       }
     }
 
+    for (const url of localUrls) {
+      addAttachmentCandidate(found, url, localMime, localName);
+    }
+
     for (const fileId of localFileIds) {
       for (const candidate of buildBackendFileUrlCandidates(
         fileId,
         Array.from(localPostIds),
         Array.from(localConversationIds)
       )) {
-        addAttachmentCandidate(found, candidate, localMime);
+        addAttachmentCandidate(found, candidate, localMime, localName);
       }
     }
   }
@@ -2771,13 +3946,13 @@ function collectReactPayloadObjects(root: ParentNode): Record<string, unknown>[]
         "button"
       ].join(",")
     )
-  ).slice(0, 120);
+  ).slice(0, 180);
   nodes.push(...selectorNodes);
 
   for (const node of nodes) {
     let current: Element | null = node;
     let depth = 0;
-    while (current && depth < 4) {
+    while (current && depth < 8) {
       const names = ownPropertyNamesSafe(current as unknown as object);
       for (const key of names) {
         if (key.startsWith("__reactProps$")) {
@@ -2829,9 +4004,9 @@ function mergeTurnAttachments(
       return `fileid:${backendFileId.toLowerCase()}`;
     }
     if (isDataUrl(raw)) {
-      return `${attachment.kind}:data:${raw.slice(0, 128)}`;
+      return `data:${raw.slice(0, 128)}`;
     }
-    return `${attachment.kind}:url:${raw}`;
+    return `url:${raw}`;
   };
   for (const item of all) {
     const urlKey = item.originalUrl.trim();
@@ -2842,10 +4017,13 @@ function mergeTurnAttachments(
     const key = normalizedSemantic || `url:${urlKey}`;
     if (deduped.has(key)) {
       const previous = deduped.get(key)!;
-      const previousKindScore = previous.kind === "file" ? 0 : 1;
-      const currentKindScore = item.kind === "file" ? 0 : 1;
+      const previousKindScore = attachmentKindScore(previous.kind);
+      const currentKindScore = attachmentKindScore(item.kind);
       if (currentKindScore > previousKindScore) {
-        deduped.set(key, item);
+        deduped.set(key, {
+          ...item,
+          mime: item.mime || previous.mime
+        });
         continue;
       }
       if (!previous.mime && item.mime) {
@@ -2907,6 +4085,11 @@ interface BackgroundAttachmentProbeResponse {
   error?: string;
 }
 
+interface BackgroundAttachmentHintLookupResponse {
+  ok?: boolean;
+  urls?: string[];
+}
+
 async function fetchDataUrlViaBackground(url: string): Promise<BackgroundAttachmentFetchResponse | null> {
   if (!isHttpUrl(url) || typeof chrome === "undefined" || !chrome.runtime?.sendMessage) {
     return null;
@@ -2956,6 +4139,38 @@ async function probeAttachmentUrlViaBackground(url: string): Promise<BackgroundA
   }
 }
 
+async function lookupTrackedAttachmentHintUrlsViaBackground(fileId: string): Promise<string[]> {
+  const normalized = fileId.trim();
+  if (!normalized || typeof chrome === "undefined" || !chrome.runtime?.sendMessage) {
+    return [];
+  }
+  try {
+    const result = (await chrome.runtime.sendMessage({
+      type: "AI_HISTORY_LOOKUP_ATTACHMENT_HINTS",
+      fileId: normalized
+    })) as BackgroundAttachmentHintLookupResponse;
+    if (!result?.ok || !Array.isArray(result.urls)) {
+      return [];
+    }
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const item of result.urls) {
+      const absolute = toAbsoluteUrl(String(item || "")) || String(item || "");
+      if (!absolute || seen.has(absolute)) {
+        continue;
+      }
+      seen.add(absolute);
+      out.push(absolute);
+      if (out.length >= 24) {
+        break;
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 function extractBackendFileIdFromUrl(rawUrl: string): string | null {
   const absolute = toAbsoluteUrl(rawUrl) || rawUrl;
   const downloadMatch = absolute.match(/\/backend-api\/files\/download\/([^/?#]+)/i);
@@ -2987,7 +4202,7 @@ function extractEstuaryFileIdFromUrl(rawUrl: string): string | null {
     ].filter(Boolean);
 
     for (const candidate of candidates) {
-      const normalized = maybeFileIdFromString(candidate, { allowUuid: true });
+      const normalized = maybeFileIdFromString(candidate, { allowUuid: true, sourceKey: "file_id" });
       if (normalized) {
         return normalized;
       }
@@ -2996,6 +4211,80 @@ function extractEstuaryFileIdFromUrl(rawUrl: string): string | null {
     return null;
   }
   return null;
+}
+
+function collectTrackedAttachmentUrlsForFileId(fileId: string): string[] {
+  const normalized = maybeFileIdFromString(fileId, { allowUuid: true, sourceKey: "file_id" });
+  if (!normalized) {
+    return [];
+  }
+  const expected = normalized.trim().toLowerCase();
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  const add = (raw: string) => {
+    const absolute = toAbsoluteUrl(raw) || raw;
+    if (!absolute) {
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(absolute, location.href);
+    } catch {
+      return;
+    }
+    const lower = parsed.toString().toLowerCase();
+    const attachmentLike =
+      lower.includes("/backend-api/files/") ||
+      lower.includes("/backend-api/estuary/content") ||
+      (parsed.hostname.toLowerCase().includes("oaiusercontent.com") && isLikelyOaiAttachmentUrl(lower));
+    if (!attachmentLike) {
+      return;
+    }
+    const candidateId =
+      extractBackendFileIdFromUrl(parsed.toString()) ||
+      extractEstuaryFileIdFromUrl(parsed.toString()) ||
+      maybeFileIdFromString(parsed.toString(), { allowUuid: true, sourceKey: "file_id" });
+    if (!candidateId || candidateId.trim().toLowerCase() !== expected) {
+      return;
+    }
+    const key = parsed.toString();
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    out.push(key);
+  };
+
+  const windowStart = activeCaptureWindowStartMs();
+  const tracked = getTrackedNetworkRecords(windowStart);
+  for (const item of tracked.slice(-1400)) {
+    if (item.method !== "GET" && item.method !== "POST") {
+      continue;
+    }
+    if (!item.ok && item.status > 0) {
+      continue;
+    }
+    add(item.url);
+  }
+
+  try {
+    const resources = performance.getEntriesByType("resource") as PerformanceResourceTiming[];
+    for (const entry of resources.slice(-1400)) {
+      if (windowStart > 0 && entry.startTime + 5 < windowStart) {
+        continue;
+      }
+      const name = String(entry.name || "").trim();
+      if (!name) {
+        continue;
+      }
+      add(name);
+    }
+  } catch {
+    // ignore
+  }
+
+  return out.slice(0, 14);
 }
 
 function buildInlineFetchCandidates(rawUrl: string): string[] {
@@ -3011,19 +4300,38 @@ function buildInlineFetchCandidates(rawUrl: string): string[] {
   };
 
   add(rawUrl);
+  const postIds = collectLikelyPostIdsFromDocument(document);
+  const conversationIds = collectLikelyConversationIdsFromDocument(document);
 
   const backendFileId = extractBackendFileIdFromUrl(rawUrl);
   if (backendFileId) {
+    for (const trackedUrl of collectTrackedAttachmentUrlsForFileId(backendFileId)) {
+      add(trackedUrl);
+    }
     const encoded = encodeURIComponent(backendFileId);
     const base = toAbsoluteUrl(`/backend-api/files/${encoded}`) || rawUrl;
     add(base);
     add(`${base}/download`);
+    // Also try estuary endpoint with this file ID
+    const estuaryUrl = toAbsoluteUrl(`/backend-api/estuary/content?id=${encoded}`);
+    if (estuaryUrl) {
+      add(estuaryUrl);
+    }
+    const estuaryUrlV0 = toAbsoluteUrl(`/backend-api/estuary/content?id=${encoded}&v=0`);
+    if (estuaryUrlV0) {
+      add(estuaryUrlV0);
+    }
+    // Try full set of backend URL candidates
+    for (const candidate of buildBackendFileUrlCandidates(backendFileId, postIds, conversationIds)) {
+      add(candidate);
+    }
   }
 
   const estuaryFileId = extractEstuaryFileIdFromUrl(rawUrl);
   if (estuaryFileId) {
-    const postIds = collectLikelyPostIdsFromDocument(document);
-    const conversationIds = collectLikelyConversationIdsFromDocument(document);
+    for (const trackedUrl of collectTrackedAttachmentUrlsForFileId(estuaryFileId)) {
+      add(trackedUrl);
+    }
     for (const candidate of buildBackendFileUrlCandidates(estuaryFileId, postIds, conversationIds)) {
       add(candidate);
     }
@@ -3031,6 +4339,12 @@ function buildInlineFetchCandidates(rawUrl: string): string[] {
     const fallbackEstuary = toAbsoluteUrl(`/backend-api/estuary/content?id=${encodeURIComponent(estuaryFileId)}`);
     if (fallbackEstuary) {
       add(fallbackEstuary);
+    }
+    const fallbackEstuaryV0 = toAbsoluteUrl(
+      `/backend-api/estuary/content?id=${encodeURIComponent(estuaryFileId)}&v=0`
+    );
+    if (fallbackEstuaryV0) {
+      add(fallbackEstuaryV0);
     }
   }
 
@@ -3046,20 +4360,59 @@ async function maybeInlineProtectedAttachment(
     return attachment;
   }
 
-  const candidates = buildInlineFetchCandidates(targetUrl).slice(0, 12);
-  const exhaustedBackendIds = new Set<string>();
-  for (const candidate of candidates) {
-    const backendFileId = extractBackendFileIdFromUrl(candidate);
-    if (backendFileId && exhaustedBackendIds.has(backendFileId)) {
+  const seedCandidates = buildInlineFetchCandidates(targetUrl).slice(0, 40);
+  const fileIds = new Set<string>();
+  const backendFileId = extractBackendFileIdFromUrl(targetUrl);
+  if (backendFileId) {
+    fileIds.add(backendFileId);
+  }
+  const estuaryFileId = extractEstuaryFileIdFromUrl(targetUrl);
+  if (estuaryFileId) {
+    fileIds.add(estuaryFileId);
+  }
+  const inlineFileId = maybeFileIdFromString(targetUrl, { allowUuid: true, sourceKey: "file_id" });
+  if (inlineFileId) {
+    fileIds.add(inlineFileId);
+  }
+
+  const hintedCandidates: string[] = [];
+  for (const fileId of fileIds) {
+    const fromBackground = await lookupTrackedAttachmentHintUrlsViaBackground(fileId);
+    for (const url of fromBackground) {
+      hintedCandidates.push(url);
+    }
+  }
+  if (hintedCandidates.length > 0) {
+    console.info("[AI_HISTORY] background tracked attachment hints", {
+      targetUrl: targetUrl.slice(0, 180),
+      fileIds: Array.from(fileIds).slice(0, 3),
+      hinted: hintedCandidates.slice(0, 6)
+    });
+  }
+
+  const candidates: string[] = [];
+  const seenCandidates = new Set<string>();
+  for (const item of [...hintedCandidates, ...seedCandidates]) {
+    const absolute = toAbsoluteUrl(item) || item;
+    if (!absolute || seenCandidates.has(absolute)) {
       continue;
     }
-
+    seenCandidates.add(absolute);
+    candidates.push(absolute);
+    if (candidates.length >= 36) {
+      break;
+    }
+  }
+  for (const candidate of candidates) {
     try {
       const backgroundResult = await fetchDataUrlViaBackground(candidate);
       const backgroundDataUrl =
         backgroundResult?.ok && typeof backgroundResult.dataUrl === "string" ? backgroundResult.dataUrl : null;
       if (backgroundDataUrl) {
-        const kind = inferAttachmentKind(backgroundDataUrl, "");
+        const inferredKind = inferAttachmentKind(backgroundDataUrl, "");
+        const kind =
+          attachmentKindScore(inferredKind) >= attachmentKindScore(attachment.kind) ? inferredKind : attachment.kind;
+        const inferredMime = inferAttachmentMime(inferredKind, backgroundDataUrl) || inferAttachmentMime(kind, backgroundDataUrl);
         console.info("[AI_HISTORY] inlined attachment from background fetch", {
           candidate,
           kind
@@ -3068,14 +4421,9 @@ async function maybeInlineProtectedAttachment(
           ...attachment,
           kind,
           originalUrl: backgroundDataUrl,
-          mime: attachment.mime || inferAttachmentMime(kind, backgroundDataUrl),
+          mime: attachment.mime || inferredMime,
           status: "remote_only"
         };
-      }
-
-      if (backendFileId && (backgroundResult?.tried?.length ?? 0) > 0) {
-        exhaustedBackendIds.add(backendFileId);
-        continue;
       }
 
       const controller = new AbortController();
@@ -3123,8 +4471,15 @@ async function maybeInlineProtectedAttachment(
         continue;
       }
 
-      const kind = inferAttachmentKind(dataUrl, "");
-      const mime = (blob.type || attachment.mime || inferAttachmentMime(kind, dataUrl) || null) as string | null;
+      const inferredKind = inferAttachmentKind(dataUrl, "");
+      const kind =
+        attachmentKindScore(inferredKind) >= attachmentKindScore(attachment.kind) ? inferredKind : attachment.kind;
+      const mime =
+        (blob.type ||
+          attachment.mime ||
+          inferAttachmentMime(inferredKind, dataUrl) ||
+          inferAttachmentMime(kind, dataUrl) ||
+          null) as string | null;
       console.info("[AI_HISTORY] inlined attachment from page fetch", {
         candidate,
         kind
@@ -3308,6 +4663,10 @@ function attachmentDisplayName(attachment: CaptureAttachment): string {
     return "未命名附件";
   }
   if (isDataUrl(raw)) {
+    const explicitName = parseDataUrlName(raw);
+    if (explicitName) {
+      return explicitName;
+    }
     return attachment.kind === "pdf" ? "PDF 文件" : attachment.kind === "image" ? "图片文件" : "文件";
   }
   try {
@@ -3373,7 +4732,7 @@ function shouldRequireAttachmentDownload(source: CaptureSource, turn: CaptureTur
   }
 
   if (isVirtualAttachmentUrl(url)) {
-    return true;
+    return false;
   }
 
   if (lower.includes("oaiusercontent.com") && !isLikelyOaiAttachmentUrl(lower)) {
@@ -3474,6 +4833,9 @@ function stripVirtualPlaceholdersWhenRealAttachmentExists(
       .map((attachment) => attachmentDisplayName(attachment).trim().toLowerCase())
       .filter(Boolean)
   );
+  const realNameStems = new Set(
+    Array.from(realNames).map((name) => name.replace(/\.[a-z0-9]{1,10}$/i, ""))
+  );
 
   const stripped = attachments.filter((attachment) => {
     if (!isVirtualAttachmentUrl(attachment.originalUrl)) {
@@ -3483,7 +4845,14 @@ function stripVirtualPlaceholdersWhenRealAttachmentExists(
     if (!virtualName) {
       return false;
     }
-    return !realNames.has(virtualName);
+    if (realNames.has(virtualName)) {
+      return false;
+    }
+    const virtualStem = virtualName.replace(/\.[a-z0-9]{1,10}$/i, "");
+    if (virtualStem && realNameStems.has(virtualStem)) {
+      return false;
+    }
+    return true;
   });
 
   if (!stripped.some((attachment) => !isVirtualAttachmentUrl(attachment.originalUrl))) {
@@ -3504,7 +4873,7 @@ function isGenericDerivedAttachmentName(name: string): boolean {
   if (/^file[_-][a-z0-9]+(?:\.[a-z0-9]{2,6})?$/i.test(lower)) {
     return true;
   }
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:\.[a-z0-9]{2,6})?$/i.test(lower)) {
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.[a-z0-9]{2,6})?$/i.test(lower)) {
     return true;
   }
   return false;
@@ -3532,10 +4901,19 @@ function stripRedundantFailedAttachments(attachments: CaptureAttachment[]): Capt
       return true;
     }
     const name = attachmentDisplayName(attachment);
-    if (!isGenericDerivedAttachmentName(name)) {
+    const isGeneric = isGenericDerivedAttachmentName(name);
+    if (!isGeneric) {
       return true;
     }
+    // Generic backend IDs (uuid/file_xxx) are noisy placeholders in UI;
+    // keep meaningful named failures only.
+    if (isGeneric && attachment.kind !== "pdf") {
+      return false;
+    }
     if (cachedKinds.has(attachment.kind)) {
+      return false;
+    }
+    if (attachment.kind !== "file" && cachedKinds.has("file")) {
       return false;
     }
     if (attachment.kind === "file" && cachedKinds.size > 0) {
@@ -3693,7 +5071,21 @@ export async function materializeAttachmentsOrThrow(
 
     const deduped = mergeTurnAttachments([], normalized) ?? [];
     const cleaned = stripRedundantFailedAttachments(deduped);
-    const retainedFailed = cleaned.filter((attachment) => attachment.status === "failed");
+    const cleanedWithoutVirtual = stripVirtualPlaceholdersWhenRealAttachmentExists(cleaned);
+    const normalizedForOutput = cleanedWithoutVirtual.map((attachment) => {
+      if (isVirtualAttachmentUrl(attachment.originalUrl)) {
+        pendingFailureReasonByUrl.set(
+          attachment.originalUrl.trim(),
+          "仅提取到文件名，未拿到真实文件链接"
+        );
+        return {
+          ...attachment,
+          status: "failed" as const
+        };
+      }
+      return attachment;
+    });
+    const retainedFailed = normalizedForOutput.filter((attachment) => attachment.status === "failed");
     for (const failed of retainedFailed) {
       const reason = pendingFailureReasonByUrl.get(failed.originalUrl.trim()) || "插件下载失败";
       failures.push(`${attachmentDisplayName(failed)}（${reason}）`);
@@ -3708,11 +5100,11 @@ export async function materializeAttachmentsOrThrow(
 
     output.push({
       ...turn,
-      attachments: mergeTurnAttachments([], cleaned)
+      attachments: mergeTurnAttachments([], normalizedForOutput)
     });
 
     if (source === "chatgpt" || source === "ai_studio") {
-      const unresolved = detectUnresolvedUserUploadFromText(turn, cleaned);
+      const unresolved = detectUnresolvedUserUploadFromText(turn, normalizedForOutput);
       if (unresolved.length > 0) {
         for (const name of unresolved) {
           failures.push(`${name}（仅识别到文件名，未抓到可下载链接）`);

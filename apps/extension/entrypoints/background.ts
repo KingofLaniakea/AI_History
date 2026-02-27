@@ -3,7 +3,18 @@ import { inferSourceFromUrl, type CapturePayload } from "./lib/extractor";
 const BRIDGE_BASE = "http://127.0.0.1:48765";
 const MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024;
 const ATTACHMENT_FETCH_TIMEOUT_MS = 15000;
-const CONTENT_SCRIPT_VERSION = "2026-02-23-r9-real-attachments";
+const CONTENT_SCRIPT_VERSION = "2026-02-27-r31-react-handler-prime-for-word";
+const MAX_RECENT_ATTACHMENT_REQUESTS = 3200;
+
+interface TrackedAttachmentRequest {
+  url: string;
+  startedAt: number;
+  tabId: number;
+  method: string;
+}
+
+const trackedAttachmentRequests: TrackedAttachmentRequest[] = [];
+let attachmentHintWebRequestListenerInstalled = false;
 
 interface CaptureProgressPayload {
   runId: string;
@@ -316,6 +327,128 @@ function isHttpUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
 }
 
+function isLikelyAttachmentHintUrl(value: string): boolean {
+  const lower = value.toLowerCase();
+  return (
+    lower.includes("/backend-api/files/") ||
+    lower.includes("/backend-api/estuary/content") ||
+    (lower.includes("oaiusercontent.com") &&
+      (
+        /[?&](download|filename|attachment|response-content-disposition)=/i.test(lower) ||
+        /(?:^|[/?&])file[_-][a-z0-9-]{6,}/i.test(lower)
+      ))
+  );
+}
+
+function extractFileIdFromTrackedUrl(rawUrl: string): string | null {
+  const absolute = rawUrl.trim();
+  if (!absolute) {
+    return null;
+  }
+  const directDownloadMatch = absolute.match(/\/backend-api\/files\/download\/([^/?#]+)/i);
+  if (directDownloadMatch?.[1]) {
+    return safeDecodeURIComponent(directDownloadMatch[1]).trim() || null;
+  }
+  const directFileMatch = absolute.match(/\/backend-api\/files\/([^/?#]+)/i);
+  if (directFileMatch?.[1]) {
+    const candidate = safeDecodeURIComponent(directFileMatch[1]).trim();
+    if (candidate && candidate.toLowerCase() !== "download") {
+      return candidate;
+    }
+  }
+  try {
+    const parsed = new URL(absolute);
+    const byQuery = (
+      parsed.searchParams.get("id") ||
+      parsed.searchParams.get("file_id") ||
+      parsed.searchParams.get("fileId") ||
+      ""
+    ).trim();
+    if (byQuery) {
+      return safeDecodeURIComponent(byQuery).trim() || null;
+    }
+  } catch {
+    // ignore
+  }
+  const fromText = absolute.match(/\bfile[_-][a-z0-9-]{6,}\b/i)?.[0];
+  if (fromText) {
+    return fromText;
+  }
+  return null;
+}
+
+function pushTrackedAttachmentRequest(url: string, tabId: number, method: string): void {
+  const normalizedUrl = url.trim();
+  if (!normalizedUrl || !isLikelyAttachmentHintUrl(normalizedUrl)) {
+    return;
+  }
+  trackedAttachmentRequests.push({
+    url: normalizedUrl,
+    startedAt: Date.now(),
+    tabId,
+    method: method.toUpperCase()
+  });
+  if (trackedAttachmentRequests.length > MAX_RECENT_ATTACHMENT_REQUESTS) {
+    trackedAttachmentRequests.splice(0, trackedAttachmentRequests.length - MAX_RECENT_ATTACHMENT_REQUESTS);
+  }
+}
+
+function findTrackedAttachmentHintUrls(fileId: string, tabId: number): string[] {
+  const expected = fileId.trim().toLowerCase();
+  if (!expected) {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const cutoff = Date.now() - 8 * 60 * 1000;
+  for (let index = trackedAttachmentRequests.length - 1; index >= 0; index -= 1) {
+    const item = trackedAttachmentRequests[index]!;
+    if (item.startedAt < cutoff) {
+      break;
+    }
+    if (item.tabId >= 0 && tabId >= 0 && item.tabId !== tabId) {
+      continue;
+    }
+    const candidateId = extractFileIdFromTrackedUrl(item.url);
+    if (!candidateId || candidateId.trim().toLowerCase() !== expected) {
+      continue;
+    }
+    if (seen.has(item.url)) {
+      continue;
+    }
+    seen.add(item.url);
+    out.push(item.url);
+    if (out.length >= 24) {
+      break;
+    }
+  }
+  return out;
+}
+
+function ensureAttachmentHintWebRequestListener(): void {
+  if (attachmentHintWebRequestListenerInstalled) {
+    return;
+  }
+  attachmentHintWebRequestListenerInstalled = true;
+  if (!chrome.webRequest?.onBeforeRequest) {
+    return;
+  }
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      const url = String(details.url || "").trim();
+      const tabId = typeof details.tabId === "number" ? details.tabId : -1;
+      const method = String(details.method || "GET").toUpperCase();
+      pushTrackedAttachmentRequest(url, tabId, method);
+    },
+    {
+      urls: [
+        "https://chatgpt.com/*",
+        "https://*.oaiusercontent.com/*"
+      ]
+    }
+  );
+}
+
 function isGenericMimeType(mime: string): boolean {
   const normalized = mime.trim().toLowerCase();
   return (
@@ -469,35 +602,252 @@ type AttachmentFetchResponse = {
   tried?: string[];
 };
 
+function toAbsoluteHttpUrl(raw: string, baseUrl: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (isHttpUrl(trimmed)) {
+    return trimmed;
+  }
+  const normalized = trimmed.startsWith("backend-api/") ? `/${trimmed}` : trimmed;
+  if (!normalized.startsWith("/")) {
+    return null;
+  }
+  try {
+    const absolute = new URL(normalized, baseUrl).toString();
+    return isHttpUrl(absolute) ? absolute : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractUrlCandidatesFromText(raw: string, baseUrl: string): string[] {
+  const text = raw.replace(/\\\//g, "/");
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (value: string) => {
+    const normalized = toAbsoluteHttpUrl(value, baseUrl);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  for (const match of text.matchAll(/https?:\/\/[^\s"'<>\\]+/gi)) {
+    if (match[0]) {
+      add(match[0]);
+    }
+  }
+  for (const match of text.matchAll(/\/backend-api\/[^\s"'<>\\]+/gi)) {
+    if (match[0]) {
+      add(match[0]);
+    }
+  }
+  return out;
+}
+
+function collectRedirectUrlCandidatesFromPayload(payload: unknown, baseUrl: string): string[] {
+  const out: string[] = [];
+  const seenUrls = new Set<string>();
+  const visited = new Set<object>();
+  const queue: unknown[] = [payload];
+  const priorityKeys = [
+    "download_url",
+    "downloadUrl",
+    "download_link",
+    "downloadLink",
+    "signed_download_url",
+    "signedDownloadUrl",
+    "signed_url",
+    "signedUrl",
+    "presigned_url",
+    "presignedUrl",
+    "file_url",
+    "fileUrl",
+    "content_url",
+    "contentUrl",
+    "retrieval_url",
+    "retrievalUrl",
+    "href",
+    "url",
+    "link"
+  ];
+  const keyHintRegex = /(url|link|href|download|signed|presign|content|asset|file|path)/i;
+
+  const add = (value: string) => {
+    const normalized = toAbsoluteHttpUrl(value, baseUrl);
+    if (!normalized || seenUrls.has(normalized)) {
+      return;
+    }
+    seenUrls.add(normalized);
+    out.push(normalized);
+  };
+
+  for (let index = 0; index < queue.length && index < 2600; index += 1) {
+    const node = queue[index];
+    if (!node) {
+      continue;
+    }
+    if (typeof node === "string") {
+      add(node);
+      for (const candidate of extractUrlCandidatesFromText(node, baseUrl)) {
+        add(candidate);
+      }
+      continue;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        queue.push(item);
+      }
+      continue;
+    }
+    if (typeof node !== "object") {
+      continue;
+    }
+    if (visited.has(node as object)) {
+      continue;
+    }
+    visited.add(node as object);
+    const record = node as Record<string, unknown>;
+
+    for (const key of priorityKeys) {
+      const value = record[key];
+      if (typeof value === "string") {
+        add(value);
+      }
+    }
+
+    for (const [key, value] of Object.entries(record)) {
+      if (typeof value === "string") {
+        if (keyHintRegex.test(key)) {
+          add(value);
+        }
+        if (value.includes("http://") || value.includes("https://") || value.includes("/backend-api/")) {
+          for (const candidate of extractUrlCandidatesFromText(value, baseUrl)) {
+            add(candidate);
+          }
+        }
+        continue;
+      }
+      queue.push(value);
+    }
+  }
+
+  return out;
+}
+
+function pickRedirectUrlFromPayload(payload: unknown, baseUrl: string, tried: string[]): string | null {
+  const triedSet = new Set(tried);
+  for (const candidate of collectRedirectUrlCandidatesFromPayload(payload, baseUrl)) {
+    if (!triedSet.has(candidate)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
 async function fetchAttachmentAsDataUrl(url: string): Promise<AttachmentFetchResponse> {
   if (!isHttpUrl(url)) {
     return { ok: false, error: "仅支持 http(s) 下载" };
   }
 
   const tried: string[] = [url];
+  const triedRequestKeys = new Set<string>();
 
-  const doFetch = async (targetUrl: string): Promise<AttachmentFetchResponse | null> => {
+  const doFetch = async (
+    targetUrl: string,
+    init: {
+      method?: "GET" | "POST";
+      headers?: Record<string, string>;
+      body?: string;
+    } = {}
+  ): Promise<AttachmentFetchResponse | null> => {
+    const method = (init.method || "GET").toUpperCase() as "GET" | "POST";
+    const requestKey = `${method} ${targetUrl}`;
+    if (triedRequestKeys.has(requestKey)) {
+      return null;
+    }
+    triedRequestKeys.add(requestKey);
+    if (!tried.includes(targetUrl)) {
+      tried.push(targetUrl);
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ATTACHMENT_FETCH_TIMEOUT_MS);
     let response: Response;
     try {
       response = await fetch(targetUrl, {
+        method,
         credentials: "include",
         redirect: "follow",
         cache: "no-store",
         signal: controller.signal,
-        headers: { Accept: "*/*" }
+        headers: {
+          Accept: "*/*",
+          ...(init.headers || {})
+        },
+        body: method === "POST" ? (init.body ?? "{}") : undefined
       });
     } finally {
       clearTimeout(timer);
     }
 
-    if (!response.ok) {
-      return null;
-    }
-
     const contentType = (response.headers.get("content-type") || "").toLowerCase();
     let normalizedMime = normalizeMimeType(contentType);
+
+    if (!response.ok) {
+      if (normalizedMime.includes("application/json")) {
+        try {
+          const payload = (await response.json()) as unknown;
+          const redirectUrl = pickRedirectUrlFromPayload(payload, response.url || targetUrl, tried);
+          if (redirectUrl) {
+            return doFetch(redirectUrl);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (
+        (response.status === 422 || response.status === 405 || response.status === 400) &&
+        method === "GET" &&
+        /\/backend-api\/(?:files\/download\/|files\/[^/?#]+\/download|estuary\/content)/i.test(targetUrl)
+      ) {
+        const postResult = await doFetch(targetUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, */*;q=0.8"
+          },
+          body: "{}"
+        });
+        if (postResult) {
+          return postResult;
+        }
+      }
+
+      // Fallback: some APIs return URL hints in text even on non-2xx.
+      try {
+        const text = await response.text();
+        const textCandidates = extractUrlCandidatesFromText(text, response.url || targetUrl);
+        for (const candidate of textCandidates) {
+          if (!tried.includes(candidate)) {
+            const result = await doFetch(candidate);
+            if (result) {
+              return result;
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return {
+        ok: false,
+        status: response.status,
+        error: `HTTP ${response.status}`,
+        tried
+      };
+    }
+
     const contentDisposition = response.headers.get("content-disposition") || "";
     const fileNameFromHeader = parseContentDispositionFileName(contentDisposition);
     const fileNameFromUrl = extractFileNameFromUrl(response.url || targetUrl);
@@ -512,14 +862,8 @@ async function fetchAttachmentAsDataUrl(url: string): Promise<AttachmentFetchRes
       } catch {
         return null;
       }
-      const redirectUrl =
-        typeof payload?.download_url === "string"
-          ? payload.download_url
-          : typeof payload?.url === "string"
-            ? payload.url
-            : null;
-      if (redirectUrl && isHttpUrl(redirectUrl) && !tried.includes(redirectUrl)) {
-        tried.push(redirectUrl);
+      const redirectUrl = pickRedirectUrlFromPayload(payload, response.url || targetUrl, tried);
+      if (redirectUrl && isHttpUrl(redirectUrl)) {
         return doFetch(redirectUrl);
       }
       return null;
@@ -675,7 +1019,8 @@ async function probeAttachmentUrl(url: string): Promise<{
 }
 
 export default defineBackground(() => {
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  ensureAttachmentHintWebRequestListener();
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.type === "AI_HISTORY_CAPTURE_PROGRESS") {
       const runId = String(message.runId || "").trim();
       if (runId) {
@@ -719,6 +1064,17 @@ export default defineBackground(() => {
           })
         );
       return true;
+    }
+
+    if (message?.type === "AI_HISTORY_LOOKUP_ATTACHMENT_HINTS") {
+      const fileId = String(message.fileId || "").trim();
+      const senderTabId = typeof sender?.tab?.id === "number" ? sender.tab.id : -1;
+      const urls = fileId ? findTrackedAttachmentHintUrls(fileId, senderTabId) : [];
+      sendResponse({
+        ok: true,
+        urls
+      });
+      return;
     }
 
     if (message?.type === "CAPTURE_CURRENT_TAB") {
