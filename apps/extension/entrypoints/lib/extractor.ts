@@ -14,14 +14,15 @@ export {
 
 export {
   countMaterializableAttachments,
-  materializeAttachmentsOrThrow,
-  type AttachmentMaterializeProgress
-} from "./extractor/attachments/materialize";
+  materializeAttachmentsOrThrow
+} from "./extractor/source/chatgpt";
+
+export type { AttachmentMaterializeProgress } from "./extractor/attachments/materialize";
 
 export {
   warmupAiStudioLazyResources,
   warmupSourceLazyResources
-} from "./extractor/warmup";
+} from "./extractor/source/chatgpt";
 
 export {
   enrichChatGptTurnsWithApiAttachments,

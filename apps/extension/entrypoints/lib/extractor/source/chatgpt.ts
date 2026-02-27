@@ -10,7 +10,57 @@ import {
   looksLikeImageUrl,
   looksLikePdfUrl
 } from "../attachments/classify";
+import {
+  countMaterializableAttachmentsWith,
+  materializeAttachmentsOrThrowWith,
+  type AttachmentMaterializeProgress,
+  type MaterializeAttachmentOptions
+} from "../attachments/materialize";
+import {
+  warmupAiStudioLazyResourcesWith,
+  warmupSourceLazyResourcesWith
+} from "../warmup";
 import { extractGeminiTurnsWith } from "./gemini";
+import {
+  activeCaptureWindowStartMs as activeCaptureWindowStartMsFromTracker,
+  beginCaptureSessionWindow as beginCaptureSessionWindowFromTracker,
+  ensureRuntimeNetworkTracker as ensureRuntimeNetworkTrackerFromTracker,
+  getTrackedNetworkRecords as getTrackedNetworkRecordsFromTracker,
+  type TrackedNetworkRecord
+} from "../network/tracker";
+import {
+  buildTurn as buildTurnFromCommon,
+  decodeHtml as decodeHtmlFromCommon,
+  dedupeTurns as dedupeTurnsFromCommon,
+  extractNodeTextAndThought as extractNodeTextAndThoughtFromCommon,
+  fixDanglingMathDelimiters as fixDanglingMathDelimitersFromCommon,
+  fixMatrixRows as fixMatrixRowsFromCommon,
+  htmlToMarkdownish as htmlToMarkdownishFromCommon,
+  isNavigationUrl as isNavigationUrlFromCommon,
+  leafNodes as leafNodesFromCommon,
+  normalizeForDedupe as normalizeForDedupeFromCommon,
+  normalizeForGeminiFilter as normalizeForGeminiFilterFromCommon,
+  normalizeMarkdownText as normalizeMarkdownTextFromCommon,
+  parseByRoleMarkers as parseByRoleMarkersFromCommon,
+  readLatex as readLatexFromCommon,
+  replaceMathWithLatex as replaceMathWithLatexFromCommon,
+  roleFromAttrs as roleFromAttrsFromCommon,
+  sanitizeGeminiTurn as sanitizeGeminiTurnFromCommon,
+  splitThoughts as splitThoughtsFromCommon,
+  stripGeminiBoilerplate as stripGeminiBoilerplateFromCommon,
+  stripGeminiUiPrefixes as stripGeminiUiPrefixesFromCommon,
+  stripHtmlTags as stripHtmlTagsFromCommon,
+  wrapStandaloneLatexBlocks as wrapStandaloneLatexBlocksFromCommon
+} from "./common";
+import {
+  moveScrollerSlowly as moveScrollerSlowlyFromWarmupCommon,
+  pickScrollableElement as pickScrollableElementFromWarmupCommon,
+  sleep as sleepFromWarmupCommon,
+  waitForTrackedNetworkSettle as waitForTrackedNetworkSettleFromWarmupCommon,
+  warmupScrollableArea as warmupScrollableAreaFromWarmupCommon,
+  type SlowMoveResult,
+  type WarmupConfig
+} from "../warmup/common";
 
 export type CaptureSource = "chatgpt" | "gemini" | "ai_studio" | "claude";
 
@@ -39,578 +89,67 @@ export interface CapturePayload {
   version: string;
 }
 
-const NOISE_LINE_REGEX =
-  /^(skip to main content|home|settings|menu_open|menu|share|compare_arrows|add|more_vert|edit|chevron_right|chevron_left|trending_flat|developer_guide|documentation|expand_more|expand to view model thoughts|model thoughts|token(s)?|get api key|application|content_copy|thumb_up|thumb_down|volume_up|flag|restart_alt|stop|send|mic|attach_file|photo_camera|light_mode|dark_mode|edit_note|arrow_drop_down|arrow_drop_up|close|check|done|info|warning|error|search|filter_list|sort|visibility|visibility_off)$/i;
-
-const GEMINI_BOILERPLATE_MARKERS = [
-  "如果你想让我保存或删除我们对话中关于你的信息",
-  "你需要先开启过往对话记录",
-  "你也可以手动添加或更新你给gemini的指令",
-  "从而定制gemini的回复",
-  "ifyouwantmetosaveordeleteinformationfromourconversations",
-  "youneedtoturnonchathistory",
-  "youcanalsomanuallyaddorupdateyourinstructionsforgemini"
-];
-
 const MAX_INLINE_ATTACHMENT_BYTES = 64 * 1024 * 1024;
-const NETWORK_TRACKER_KEY = "__AI_HISTORY_NETWORK_TRACKER__";
-const MAX_TRACKED_NETWORK_RECORDS = 2400;
 const UUID_LIKE_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-interface TrackedNetworkRecord {
-  url: string;
-  method: string;
-  startedAt: number;
-  status: number;
-  ok: boolean;
-}
-
-interface NetworkTrackerState {
-  installed: boolean;
-  records: TrackedNetworkRecord[];
-  inFlight: number;
-}
-
-type TrackerWindow = Window & {
-  [NETWORK_TRACKER_KEY]?: NetworkTrackerState;
-};
-
-let captureWindowStartMs = 0;
-
 export function beginCaptureSessionWindow(): void {
-  ensureRuntimeNetworkTracker();
-  captureWindowStartMs = performance.now();
+  beginCaptureSessionWindowFromTracker();
 }
 
 function activeCaptureWindowStartMs(): number {
-  return Number.isFinite(captureWindowStartMs) && captureWindowStartMs > 0 ? captureWindowStartMs : 0;
-}
-
-function resolveRequestUrl(input: RequestInfo | URL): string {
-  if (typeof input === "string") {
-    return toAbsoluteUrl(input) || input;
-  }
-  if (input instanceof URL) {
-    return input.toString();
-  }
-  if (typeof Request !== "undefined" && input instanceof Request) {
-    return input.url || "";
-  }
-  return String(input || "");
-}
-
-function trackerState(): NetworkTrackerState {
-  const globalWindow = window as TrackerWindow;
-  if (!globalWindow[NETWORK_TRACKER_KEY]) {
-    globalWindow[NETWORK_TRACKER_KEY] = {
-      installed: false,
-      records: [],
-      inFlight: 0
-    };
-  }
-  return globalWindow[NETWORK_TRACKER_KEY]!;
-}
-
-function pushTrackedNetworkRecord(record: TrackedNetworkRecord): void {
-  if (!record.url) {
-    return;
-  }
-  const state = trackerState();
-  state.records.push(record);
-  if (state.records.length > MAX_TRACKED_NETWORK_RECORDS) {
-    const overflow = state.records.length - MAX_TRACKED_NETWORK_RECORDS;
-    state.records.splice(0, overflow);
-  }
-}
-
-function incrementTrackedInFlight(): void {
-  const state = trackerState();
-  state.inFlight += 1;
-}
-
-function decrementTrackedInFlight(): void {
-  const state = trackerState();
-  state.inFlight = Math.max(0, state.inFlight - 1);
-}
-
-function getTrackedInFlightCount(): number {
-  ensureRuntimeNetworkTracker();
-  return trackerState().inFlight;
+  return activeCaptureWindowStartMsFromTracker();
 }
 
 function ensureRuntimeNetworkTracker(): void {
-  const state = trackerState();
-  if (state.installed) {
-    return;
-  }
-  state.installed = true;
-
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const startedAt = performance.now();
-    const method = (init?.method || (typeof Request !== "undefined" && input instanceof Request ? input.method : "GET"))
-      .toString()
-      .toUpperCase();
-    const requestedUrl = resolveRequestUrl(input);
-    incrementTrackedInFlight();
-    try {
-      const response = await originalFetch(input, init);
-      pushTrackedNetworkRecord({
-        url: response.url || requestedUrl,
-        method,
-        startedAt,
-        status: response.status,
-        ok: response.ok
-      });
-      return response;
-    } catch (error) {
-      pushTrackedNetworkRecord({
-        url: requestedUrl,
-        method,
-        startedAt,
-        status: 0,
-        ok: false
-      });
-      throw error;
-    } finally {
-      decrementTrackedInFlight();
-    }
-  }) as typeof window.fetch;
-
-  const originalOpen = XMLHttpRequest.prototype.open;
-  const originalSend = XMLHttpRequest.prototype.send;
-
-  XMLHttpRequest.prototype.open = function patchedOpen(
-    method: string,
-    url: string | URL,
-    async?: boolean,
-    username?: string | null,
-    password?: string | null
-  ): void {
-    const self = this as XMLHttpRequest & { __aihMethod?: string; __aihUrl?: string };
-    self.__aihMethod = (method || "GET").toString().toUpperCase();
-    self.__aihUrl = toAbsoluteUrl(String(url || "")) || String(url || "");
-    originalOpen.call(this, method, url, async ?? true, username ?? null, password ?? null);
-  };
-
-  XMLHttpRequest.prototype.send = function patchedSend(body?: Document | XMLHttpRequestBodyInit | null): void {
-    const self = this as XMLHttpRequest & { __aihMethod?: string; __aihUrl?: string };
-    const startedAt = performance.now();
-    incrementTrackedInFlight();
-    let finalized = false;
-    const finalize = () => {
-      if (finalized) {
-        return;
-      }
-      finalized = true;
-      pushTrackedNetworkRecord({
-        url: self.responseURL || self.__aihUrl || "",
-        method: (self.__aihMethod || "GET").toUpperCase(),
-        startedAt,
-        status: Number(self.status || 0),
-        ok: Number(self.status || 0) >= 200 && Number(self.status || 0) < 400
-      });
-      decrementTrackedInFlight();
-      self.removeEventListener("loadend", finalize);
-    };
-    self.addEventListener("loadend", finalize);
-    try {
-      originalSend.call(this, body ?? null);
-    } catch (error) {
-      finalize();
-      throw error;
-    }
-  };
-
-  const captureNavigationLikeAttachmentUrl = (raw: unknown): void => {
-    if (typeof raw !== "string" && !(raw instanceof URL)) {
-      return;
-    }
-    const text = typeof raw === "string" ? raw : raw.toString();
-    const absolute = toAbsoluteUrl(text) || text;
-    if (!absolute || !isLikelyAttachmentUrl(absolute)) {
-      return;
-    }
-    pushTrackedNetworkRecord({
-      url: absolute,
-      method: "GET",
-      startedAt: performance.now(),
-      status: 200,
-      ok: true
-    });
-  };
-
-  try {
-    const originalWindowOpen = window.open.bind(window);
-    window.open = function patchedWindowOpen(
-      url?: string | URL,
-      target?: string,
-      features?: string
-    ): Window | null {
-      captureNavigationLikeAttachmentUrl(url ?? "");
-      return originalWindowOpen(url, target, features);
-    };
-  } catch {
-    // ignore
-  }
-
-  try {
-    const originalAnchorClick = HTMLAnchorElement.prototype.click;
-    HTMLAnchorElement.prototype.click = function patchedAnchorClick(this: HTMLAnchorElement): void {
-      captureNavigationLikeAttachmentUrl(this.href || this.getAttribute("href") || "");
-      originalAnchorClick.call(this);
-    };
-  } catch {
-    // ignore
-  }
-
-  try {
-    const originalAssign = Location.prototype.assign;
-    Location.prototype.assign = function patchedAssign(this: Location, url: string | URL): void {
-      captureNavigationLikeAttachmentUrl(url);
-      originalAssign.call(this, String(url));
-    };
-  } catch {
-    // ignore
-  }
-
-  try {
-    const originalReplace = Location.prototype.replace;
-    Location.prototype.replace = function patchedReplace(this: Location, url: string | URL): void {
-      captureNavigationLikeAttachmentUrl(url);
-      originalReplace.call(this, String(url));
-    };
-  } catch {
-    // ignore
-  }
-
-  try {
-    document.addEventListener(
-      "click",
-      (event) => {
-        const path = typeof event.composedPath === "function" ? event.composedPath() : [];
-        for (const item of path) {
-          if (item instanceof HTMLAnchorElement) {
-            captureNavigationLikeAttachmentUrl(item.href || item.getAttribute("href") || "");
-            break;
-          }
-        }
-      },
-      true
-    );
-  } catch {
-    // ignore
-  }
+  ensureRuntimeNetworkTrackerFromTracker();
 }
 
 function getTrackedNetworkRecords(sinceMs = 0): TrackedNetworkRecord[] {
-  ensureRuntimeNetworkTracker();
-  const state = trackerState();
-  if (sinceMs <= 0) {
-    return state.records.slice();
-  }
-  return state.records.filter((record) => record.startedAt >= sinceMs);
+  return getTrackedNetworkRecordsFromTracker(sinceMs);
 }
 
 function decodeHtml(text: string): string {
-  const textarea = document.createElement("textarea");
-  textarea.innerHTML = text;
-  return textarea.value;
+  return decodeHtmlFromCommon(text);
 }
 
 function stripHtmlTags(text: string): string {
-  return text.replace(/<[^>]+>/g, " ");
+  return stripHtmlTagsFromCommon(text);
 }
 
 function fixDanglingMathDelimiters(text: string): string {
-  const lines = text.split("\n");
-  const fixedLines = lines.map((line) => {
-    const trimmed = line.trim();
-    const hasLatexSignals = /\\[a-zA-Z]+|[_^{}]/.test(trimmed);
-    const blockCount = (line.match(/\$\$/g) || []).length;
-
-    if (blockCount === 1 && hasLatexSignals) {
-      if (trimmed.endsWith("$$") && !trimmed.startsWith("$$")) {
-        const expr = trimmed.slice(0, -2).trim();
-        return line.replace(trimmed, `$$${expr}$$`);
-      }
-      if (trimmed.startsWith("$$") && !trimmed.endsWith("$$")) {
-        const expr = trimmed.slice(2).trim();
-        return line.replace(trimmed, `$$${expr}$$`);
-      }
-    }
-
-    return line;
-  });
-
-  let result = fixedLines.join("\n");
-  const totalBlockDelimiters = (result.match(/\$\$/g) || []).length;
-  if (totalBlockDelimiters % 2 === 1) {
-    result += "\n$$";
-  }
-
-  return result;
+  return fixDanglingMathDelimitersFromCommon(text);
 }
 
 function fixMatrixRows(text: string): string {
-  return text.replace(/\\begin\{pmatrix\}([\s\S]*?)\\end\{pmatrix\}/g, (_match, body: string) => {
-    const normalizedBody = body.replace(/\\\s+(?=[^\s\\])/g, "\\\\ ");
-    const rows = normalizedBody
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        if (/[^\\]\\$/.test(line)) {
-          return `${line.slice(0, -1)}\\\\`;
-        }
-        return line;
-      });
-
-    const fixedRows = rows.map((row, index) => {
-      if (index < rows.length - 1 && !/\\\\\s*$/.test(row)) {
-        return `${row} \\\\`;
-      }
-      return row;
-    });
-
-    return `\\begin{pmatrix}\n${fixedRows.join("\n")}\n\\end{pmatrix}`;
-  });
+  return fixMatrixRowsFromCommon(text);
 }
 
 function wrapStandaloneLatexBlocks(text: string): string {
-  const lines = text.split("\n");
-  const out: string[] = [];
-  let inDisplayMath = false;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? "";
-    const delimiterCount = (line.match(/\$\$/g) || []).length;
-
-    if (!inDisplayMath && /^\s*\\begin\{[a-zA-Z*]+\}/.test(line)) {
-      const block: string[] = [line];
-      let endFound = /\\end\{[a-zA-Z*]+\}/.test(line);
-
-      while (!endFound && i + 1 < lines.length) {
-        i += 1;
-        const nextLine = lines[i] ?? "";
-        block.push(nextLine);
-        if (/\\end\{[a-zA-Z*]+\}/.test(nextLine)) {
-          endFound = true;
-        }
-      }
-
-      out.push("$$");
-      out.push(...block);
-      out.push("$$");
-      continue;
-    }
-
-    out.push(line);
-    if (delimiterCount % 2 === 1) {
-      inDisplayMath = !inDisplayMath;
-    }
-  }
-
-  return out.join("\n");
+  return wrapStandaloneLatexBlocksFromCommon(text);
 }
 
 function readLatex(node: Element): string {
-  const annotation = node.querySelector("annotation");
-  if (annotation?.textContent) {
-    return decodeHtml(annotation.textContent).trim();
-  }
-
-  const attrs = [
-    node.getAttribute("data-tex"),
-    node.getAttribute("data-latex"),
-    node.getAttribute("aria-label")
-  ]
-    .filter((v): v is string => Boolean(v))
-    .map((v) => decodeHtml(v).trim())
-    .filter(Boolean);
-  if (attrs.length > 0) {
-    return attrs[0];
-  }
-
-  return "";
+  return readLatexFromCommon(node);
 }
 
 function replaceMathWithLatex(root: Element, doc: Document): void {
-  const displaySelectors = [
-    ".katex-display", "[class*='katex-display']",
-    "math[display='block']", "[data-display='block']",
-    "mjx-container[display='true']", "mjx-container[jax='CHTML'][display='true']",
-    "[class*='math-display']", "[class*='formula-display']"
-  ].join(", ");
-
-  const displayNodes = Array.from(root.querySelectorAll(displaySelectors));
-  for (const node of displayNodes) {
-    const latex = readLatex(node);
-    if (!latex) {
-      continue;
-    }
-    node.replaceWith(doc.createTextNode(`\n$$${latex}$$\n`));
-  }
-
-  const inlineSelectors = [
-    ".katex", "math", "[data-tex]", "[data-latex]",
-    "mjx-container", "[class*='math-inline']", "[class*='formula']"
-  ].join(", ");
-
-  const inlineNodes = Array.from(root.querySelectorAll(inlineSelectors));
-  for (const node of inlineNodes) {
-    if (node.closest(displaySelectors)) {
-      continue;
-    }
-    const latex = readLatex(node);
-    if (!latex) {
-      // Fallback: use textContent for math elements that have no annotation
-      const text = (node.textContent || "").trim();
-      if (text && node.tagName.toLowerCase() !== "div") {
-        node.replaceWith(doc.createTextNode(`$${text}$`));
-      }
-      continue;
-    }
-    node.replaceWith(doc.createTextNode(`$${latex}$`));
-  }
+  replaceMathWithLatexFromCommon(root, doc);
 }
 
 function htmlToMarkdownish(html: string): string {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(`<div>${html}</div>`, "text/html");
-  const root = doc.body.firstElementChild;
-  if (root) {
-    replaceMathWithLatex(root, doc);
-
-    // Remove Material Design icon elements before text extraction
-    for (const icon of Array.from(root.querySelectorAll(
-      ".material-icons, .material-symbols-outlined, .material-symbols-rounded, [class*='icon-button'], [aria-hidden='true']"
-    ))) {
-      icon.remove();
-    }
-
-    // Convert tables to Markdown before regex-based conversion
-    for (const table of Array.from(root.querySelectorAll("table"))) {
-      const rows = Array.from(table.querySelectorAll("tr"));
-      const mdRows: string[] = [];
-      for (let ri = 0; ri < rows.length; ri++) {
-        const cells = Array.from(rows[ri].querySelectorAll("th, td"));
-        const line = "| " + cells.map(c => (c.textContent || "").trim().replace(/\|/g, "\\|").replace(/\n/g, " ")).join(" | ") + " |";
-        mdRows.push(line);
-        if (ri === 0) {
-          mdRows.push("| " + cells.map(() => "---").join(" | ") + " |");
-        }
-      }
-      const mdText = "\n" + mdRows.join("\n") + "\n";
-      table.replaceWith(doc.createTextNode(mdText));
-    }
-  }
-
-  let text = (root?.innerHTML || html)
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<iframe[\s\S]*?<\/iframe>/gi, "")
-    .replace(/<svg[\s\S]*?<\/svg>/gi, "");
-
-  text = text.replace(
-    /<a\b[^>]*href=(['"])(.*?)\1[^>]*>([\s\S]*?)<\/a>/gi,
-    (_match, _quote: string, href: string, labelHtml: string) => {
-      const absoluteHref = toAbsoluteUrl(href) || href;
-      const label = decodeHtml(stripHtmlTags(labelHtml)).replace(/\s+/g, " ").trim() || absoluteHref;
-      return `[${label}](${absoluteHref})`;
-    }
-  );
-
-  text = text.replace(
-    /<img\b[^>]*src=(['"])(.*?)\1[^>]*>/gi,
-    (match: string, _quote: string, src: string) => {
-      const absoluteSrc = toAbsoluteUrl(src) || src;
-      const altMatch = match.match(/\balt=(['"])(.*?)\1/i);
-      const alt = altMatch?.[2] || "image";
-      return `![${alt}](${absoluteSrc})`;
-    }
-  );
-
-  text = text.replace(/<pre\b[^>]*>/gi, "\n```\n").replace(/<\/pre>/gi, "\n```\n");
-  text = text.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_m, code: string) => {
-    const plain = decodeHtml(stripHtmlTags(code)).trim();
-    return plain ? `\`${plain}\`` : "";
-  });
-
-  text = text
-    .replace(/<h1\b[^>]*>/gi, "\n# ")
-    .replace(/<h2\b[^>]*>/gi, "\n## ")
-    .replace(/<h3\b[^>]*>/gi, "\n### ")
-    .replace(/<h4\b[^>]*>/gi, "\n#### ")
-    .replace(/<h5\b[^>]*>/gi, "\n##### ")
-    .replace(/<h6\b[^>]*>/gi, "\n###### ");
-
-  text = text
-    .replace(/<(strong|b)\b[^>]*>/gi, "**")
-    .replace(/<\/(strong|b)>/gi, "**")
-    .replace(/<(em|i)\b[^>]*>/gi, "*")
-    .replace(/<\/(em|i)>/gi, "*");
-
-  text = text.replace(/<li\b[^>]*>/gi, "\n- ");
-
-  text = text
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|section|article|blockquote|ul|ol|table|thead|tbody|tr|h1|h2|h3|h4|h5|h6)>/gi, "\n")
-    .replace(/<(p|div|section|article|blockquote|ul|ol|table|thead|tbody|tr)\b[^>]*>/gi, "\n");
-
-  return decodeHtml(stripHtmlTags(text));
+  return htmlToMarkdownishFromCommon(html);
 }
 
 function normalizeMarkdownText(text: string): string {
-  const cleaned = decodeHtml(text)
-    .replace(/\u00a0/g, " ")
-    .replace(/\r/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<\/div>/gi, "\n");
-
-  const lines = cleaned
-    .split("\n")
-    .map((line) => line.replace(/[ \t]+$/g, ""))
-    .filter((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        return true;
-      }
-      if (NOISE_LINE_REGEX.test(trimmed)) {
-        return false;
-      }
-      if (/^more_vert(\s+more_vert)*$/i.test(trimmed)) {
-        return false;
-      }
-      if (/^chevron_right(\s+chevron_right)*$/i.test(trimmed)) {
-        return false;
-      }
-      if (/^chevron_left(\s+chevron_left)*$/i.test(trimmed)) {
-        return false;
-      }
-      return true;
-    });
-
-  const normalized = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  const fixedMatrix = fixMatrixRows(normalized);
-  const wrappedLatex = wrapStandaloneLatexBlocks(fixedMatrix);
-  return fixDanglingMathDelimiters(wrappedLatex);
+  return normalizeMarkdownTextFromCommon(text);
 }
 
 function normalizeForDedupe(content: string): string {
-  return content
-    .replace(/^you said\s*/i, "")
-    .replace(/^显示思路\s*gemini said\s*/i, "")
-    .replace(/^gemini said\s*/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
+  return normalizeForDedupeFromCommon(content);
 }
 
 function normalizeForGeminiFilter(text: string): string {
-  return text.replace(/\s+/g, "").toLowerCase();
+  return normalizeForGeminiFilterFromCommon(text);
 }
 
 function extractExtFromFileName(name: string): string {
@@ -711,23 +250,11 @@ function buildVirtualAttachmentUrl(name: string): string {
 }
 
 function stripGeminiBoilerplate(text: string): string {
-  const paragraphs = text.split(/\n{2,}/);
-  const kept = paragraphs.filter((paragraph) => {
-    const normalized = normalizeForGeminiFilter(paragraph);
-    if (!normalized) {
-      return false;
-    }
-    return !GEMINI_BOILERPLATE_MARKERS.some((marker) => normalized.includes(marker));
-  });
-  return kept.join("\n\n").trim();
+  return stripGeminiBoilerplateFromCommon(text);
 }
 
 function stripGeminiUiPrefixes(text: string): string {
-  return text
-    .replace(/^you said\s*/i, "")
-    .replace(/^gemini said\s*/i, "")
-    .replace(/^显示思路\s*id_?\s*/i, "")
-    .trim();
+  return stripGeminiUiPrefixesFromCommon(text);
 }
 
 function extractUrlsFromElement(node: Element): string[] {
@@ -824,18 +351,11 @@ export function applyDriveAttachments(turns: CaptureTurn[]): CaptureTurn[] {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return sleepFromWarmupCommon(ms);
 }
 
 function pickScrollableElement(doc: Document): HTMLElement | null {
-  const candidates = Array.from(doc.querySelectorAll("main, [role='main'], [class*='scroll'], [class*='conversation'], [class*='content']"))
-    .filter((node): node is HTMLElement => node instanceof HTMLElement)
-    .filter((node) => node.scrollHeight - node.clientHeight > 180);
-  if (!candidates.length) {
-    return null;
-  }
-  candidates.sort((a, b) => b.scrollHeight - a.scrollHeight);
-  return candidates[0] ?? null;
+  return pickScrollableElementFromWarmupCommon(doc);
 }
 
 function pickChatGptConversationScroller(doc: Document): HTMLElement | null {
@@ -975,82 +495,8 @@ function collectChatGptConversationScrollers(doc: Document): HTMLElement[] {
   return out.slice(0, 6);
 }
 
-interface WarmupConfig {
-  downSteps: number;
-  downWaitMs: number;
-  upWaitMs: number;
-}
-
 async function warmupScrollableArea(doc: Document, config: WarmupConfig): Promise<void> {
-  const scroller = pickScrollableElement(doc);
-  if (!scroller) {
-    const originY = window.scrollY;
-    const maxY = Math.max(0, document.body.scrollHeight - window.innerHeight);
-    if (maxY <= 24) {
-      await sleep(180);
-      return;
-    }
-    const steps = Math.max(4, Math.min(10, Math.ceil(maxY / 900)));
-    for (let index = 0; index <= steps; index += 1) {
-      const ratio = index / steps;
-      window.scrollTo(0, Math.round(maxY * ratio));
-      await sleep(90);
-    }
-    for (let index = steps; index >= 0; index -= 1) {
-      const ratio = index / steps;
-      window.scrollTo(0, Math.round(maxY * ratio));
-      await sleep(55);
-    }
-    window.scrollTo(0, originY);
-    await sleep(120);
-    return;
-  }
-
-  const originTop = scroller.scrollTop;
-  const maxRounds = config.downSteps;
-  let lastHeight = scroller.scrollHeight;
-
-  for (let round = 0; round < maxRounds; round++) {
-    const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-    if (maxScroll < 24) {
-      break;
-    }
-
-    const steps = Math.min(5, Math.max(2, Math.ceil(maxScroll / 900)));
-    for (let i = 1; i <= steps; i++) {
-      scroller.scrollTop = Math.round(maxScroll * (i / steps));
-      scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-      await sleep(config.downWaitMs);
-    }
-
-    await sleep(config.downWaitMs * 2);
-
-    const newHeight = scroller.scrollHeight;
-    if (newHeight <= lastHeight) {
-      break;
-    }
-    lastHeight = newHeight;
-  }
-
-  const scrollBackSteps = 5;
-  const currentTop = scroller.scrollTop;
-  for (let i = scrollBackSteps; i >= 0; i--) {
-    scroller.scrollTop = Math.round(originTop + (currentTop - originTop) * (i / scrollBackSteps));
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await sleep(config.upWaitMs);
-  }
-  scroller.scrollTop = originTop;
-  scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-  await sleep(180);
-}
-
-interface SlowMoveResult {
-  startTop: number;
-  targetTop: number;
-  endTop: number;
-  maxTopSeen: number;
-  minTopSeen: number;
-  movedPixels: number;
+  await warmupScrollableAreaFromWarmupCommon(doc, config);
 }
 
 async function moveScrollerSlowly(
@@ -1060,61 +506,11 @@ async function moveScrollerSlowly(
   steps: number,
   waitMs: number
 ): Promise<SlowMoveResult> {
-  const totalSteps = Math.max(1, steps);
-  scroller.scrollTop = Math.round(fromTop);
-  scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-  await sleep(Math.max(24, Math.round(waitMs * 0.6)));
-  const actualStart = scroller.scrollTop;
-  let maxTopSeen = actualStart;
-  let minTopSeen = actualStart;
-  for (let index = 1; index <= totalSteps; index += 1) {
-    const ratio = index / totalSteps;
-    scroller.scrollTop = Math.round(fromTop + (toTop - fromTop) * ratio);
-    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await sleep(waitMs);
-    const currentTop = scroller.scrollTop;
-    if (currentTop > maxTopSeen) {
-      maxTopSeen = currentTop;
-    }
-    if (currentTop < minTopSeen) {
-      minTopSeen = currentTop;
-    }
-  }
-  const endTop = scroller.scrollTop;
-  const movedPixels = Math.max(Math.abs(maxTopSeen - actualStart), Math.abs(actualStart - minTopSeen), Math.abs(endTop - actualStart));
-  return {
-    startTop: actualStart,
-    targetTop: Math.round(toTop),
-    endTop,
-    maxTopSeen,
-    minTopSeen,
-    movedPixels
-  };
+  return moveScrollerSlowlyFromWarmupCommon(scroller, fromTop, toTop, steps, waitMs);
 }
 
 async function waitForTrackedNetworkSettle(idleRounds = 4, intervalMs = 240): Promise<void> {
-  ensureRuntimeNetworkTracker();
-  const windowStart = activeCaptureWindowStartMs();
-  let previousCount = getTrackedNetworkRecords(windowStart).length;
-  let stableRounds = 0;
-  for (let index = 0; index < 28; index += 1) {
-    await sleep(intervalMs);
-    const inFlight = getTrackedInFlightCount();
-    const currentCount = getTrackedNetworkRecords(windowStart).length;
-    if (inFlight === 0 && currentCount === previousCount) {
-      stableRounds += 1;
-      if (stableRounds >= idleRounds) {
-        return;
-      }
-    } else {
-      stableRounds = 0;
-      previousCount = currentCount;
-    }
-  }
-  console.info("[AI_HISTORY] network settle timeout", {
-    inFlight: getTrackedInFlightCount(),
-    records: getTrackedNetworkRecords(windowStart).length
-  });
+  await waitForTrackedNetworkSettleFromWarmupCommon(idleRounds, intervalMs);
 }
 
 async function sweepChatGptScrollerSlowly(
@@ -1684,10 +1080,8 @@ async function warmupChatGptLazyResources(doc: Document = document): Promise<voi
 }
 
 export async function warmupAiStudioLazyResources(doc: Document = document): Promise<void> {
-  await warmupScrollableArea(doc, {
-    downSteps: 40,
-    downWaitMs: 130,
-    upWaitMs: 80
+  return warmupAiStudioLazyResourcesWith(doc, {
+    warmupScrollableArea
   });
 }
 
@@ -1695,68 +1089,19 @@ export async function warmupSourceLazyResources(
   source: CaptureSource,
   doc: Document = document
 ): Promise<void> {
-  ensureRuntimeNetworkTracker();
-  if (source === "ai_studio") {
-    await warmupAiStudioLazyResources(doc);
-    return;
-  }
-
-  if (source === "chatgpt") {
-    await warmupChatGptLazyResources(doc);
-    return;
-  }
-
-  await warmupScrollableArea(doc, {
-    downSteps: 40,
-    downWaitMs: 95,
-    upWaitMs: 55
+  return warmupSourceLazyResourcesWith(source, doc, {
+    ensureRuntimeNetworkTracker,
+    warmupScrollableArea,
+    warmupChatGptLazyResources
   });
 }
 
 function isNavigationUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    const host = parsed.hostname.toLowerCase();
-    const lower = parsed.toString().toLowerCase();
-    if (host.includes("oaiusercontent.com") && !isLikelyOaiAttachmentUrl(lower)) {
-      return true;
-    }
-    if (
-      /\/backend-api\/files\/|\/backend-api\/estuary\/content|\/api\/files\/|\/files\/|\/prompts\/|googleusercontent\.com\/gg\//i.test(lower) ||
-      looksLikeFileUrl(lower) ||
-      looksLikeImageUrl(lower) ||
-      looksLikePdfUrl(lower)
-    ) {
-      return false;
-    }
-    return (
-      host.includes("gemini.google.com") ||
-      host.includes("bard.google.com") ||
-      host.includes("chatgpt.com") ||
-      host.includes("aistudio.google.com")
-    );
-  } catch {
-    return false;
-  }
+  return isNavigationUrlFromCommon(url);
 }
 
 function sanitizeGeminiTurn(turn: CaptureTurn): CaptureTurn | null {
-  const base = stripGeminiUiPrefixes(turn.contentMarkdown);
-  const stripped = turn.role === "assistant" ? stripGeminiBoilerplate(base) : base;
-  let contentMarkdown = normalizeMarkdownText(stripped);
-  const hasAttachments = Boolean(turn.attachments && turn.attachments.length > 0);
-  if (!contentMarkdown && hasAttachments) {
-    contentMarkdown = "（仅附件消息）";
-  }
-  if (!contentMarkdown || contentMarkdown.length < 2) {
-    return null;
-  }
-
-  return {
-    ...turn,
-    contentMarkdown,
-    thoughtMarkdown: null
-  };
+  return sanitizeGeminiTurnFromCommon(turn);
 }
 
 function toAbsoluteUrl(url: string): string {
@@ -2082,206 +1427,35 @@ function extractAttachmentsFromMarkdownText(markdown: string): CaptureAttachment
 }
 
 function splitThoughts(raw: string): { contentMarkdown: string; thoughtMarkdown: string | null } {
-  const text = normalizeMarkdownText(raw);
-  if (!text) {
-    return { contentMarkdown: "", thoughtMarkdown: null };
-  }
-
-  const lower = text.toLowerCase();
-  const hasThoughtMarkers =
-    lower.includes("model thoughts") ||
-    lower.includes("expand to view model thoughts") ||
-    lower.startsWith("thoughts\n");
-
-  if (!hasThoughtMarkers) {
-    return { contentMarkdown: text, thoughtMarkdown: null };
-  }
-
-  const lines = text.split("\n");
-  const thoughtLines: string[] = [];
-  const contentLines: string[] = [];
-
-  let inThoughtSection = false;
-  for (const line of lines) {
-    const normalized = line.trim();
-    const lowerLine = normalized.toLowerCase();
-    if (
-      lowerLine === "thoughts" ||
-      lowerLine === "model thoughts" ||
-      lowerLine === "expand to view model thoughts"
-    ) {
-      inThoughtSection = true;
-      continue;
-    }
-
-    if (inThoughtSection && /^user[:：]?$/i.test(lowerLine)) {
-      inThoughtSection = false;
-      contentLines.push(line);
-      continue;
-    }
-
-    if (inThoughtSection) {
-      thoughtLines.push(line);
-    } else {
-      contentLines.push(line);
-    }
-  }
-
-  const thoughtMarkdown = normalizeMarkdownText(thoughtLines.join("\n"));
-  const contentMarkdown = normalizeMarkdownText(contentLines.join("\n"));
-  if (!contentMarkdown && thoughtMarkdown) {
-    // Avoid empty bubbles if only thought text is available.
-    return { contentMarkdown: thoughtMarkdown, thoughtMarkdown: null };
-  }
-  return { contentMarkdown, thoughtMarkdown: thoughtMarkdown || null };
+  return splitThoughtsFromCommon(raw);
 }
 
 function extractNodeTextAndThought(node: Element): { contentMarkdown: string; thoughtMarkdown: string | null } {
-  const cloned = node.cloneNode(true) as Element;
-  const thoughtNodes = Array.from(
-    cloned.querySelectorAll("[data-testid*='thought'], [class*='thought'], [aria-label*='thought']")
-  );
-
-  const extractedThoughts: string[] = [];
-  for (const thoughtNode of thoughtNodes) {
-    const text = normalizeMarkdownText(
-      htmlToMarkdownish((thoughtNode as HTMLElement).innerHTML || thoughtNode.textContent || "")
-    );
-    if (text) {
-      extractedThoughts.push(text);
-    }
-    thoughtNode.remove();
-  }
-
-  const richText = htmlToMarkdownish((cloned as HTMLElement).innerHTML || cloned.textContent || "");
-  const plainText = (cloned as HTMLElement).innerText || cloned.textContent || "";
-  const base = normalizeMarkdownText(richText || plainText);
-  const split = splitThoughts(base);
-  const thoughtMarkdown = normalizeMarkdownText([split.thoughtMarkdown || "", ...extractedThoughts].join("\n\n")) || null;
-  return {
-    contentMarkdown: split.contentMarkdown,
-    thoughtMarkdown
-  };
+  return extractNodeTextAndThoughtFromCommon(node);
 }
 
 function leafNodes(root: ParentNode, selector: string): Element[] {
-  const nodes = Array.from(root.querySelectorAll(selector));
-  return nodes.filter((node) => !Array.from(node.children).some((child) => (child as Element).matches(selector)));
+  return leafNodesFromCommon(root, selector);
 }
 
 function roleFromAttrs(node: Element): CaptureTurn["role"] | null {
-  const attrs = `${node.getAttribute("data-message-author-role") || ""} ${node.getAttribute("data-role") || ""} ${
-    node.getAttribute("aria-label") || ""
-  } ${node.getAttribute("data-testid") || ""} ${String((node as HTMLElement).className || "")}`.toLowerCase();
-
-  if (/user|human|prompt|query/.test(attrs)) {
-    return "user";
-  }
-  if (/assistant|model|ai|response|bot/.test(attrs)) {
-    return "assistant";
-  }
-  if (/system/.test(attrs)) {
-    return "system";
-  }
-  if (/tool|function/.test(attrs)) {
-    return "tool";
-  }
-
-  return null;
+  return roleFromAttrsFromCommon(node);
 }
 
 function buildTurn(node: Element, fallbackRole: CaptureTurn["role"] | null = null): CaptureTurn | null {
-  const role = fallbackRole ?? roleFromAttrs(node);
-  if (!role) {
-    return null;
-  }
-
-  const { contentMarkdown, thoughtMarkdown } = extractNodeTextAndThought(node);
-  const directAttachments = extractAttachments(node);
-  const textAttachments = extractAttachmentsFromMarkdownText(contentMarkdown);
-  const attachments = mergeTurnAttachments(directAttachments, textAttachments) ?? [];
-  let finalContent = contentMarkdown;
-  if ((!finalContent || finalContent.length < 2) && attachments.length > 0) {
-    finalContent = "（仅附件消息）";
-  }
-
-  if (!finalContent || finalContent.length < 2) {
-    return null;
-  }
-
-  return {
-    role,
-    contentMarkdown: finalContent,
-    thoughtMarkdown,
-    attachments: attachments.length > 0 ? attachments : null
-  };
+  return buildTurnFromCommon(node, fallbackRole, {
+    extractAttachments,
+    extractAttachmentsFromMarkdownText,
+    mergeTurnAttachments
+  });
 }
 
 function dedupeTurns(turns: CaptureTurn[]): CaptureTurn[] {
-  const indexByKey = new Map<string, number>();
-  const out: CaptureTurn[] = [];
-
-  for (const turn of turns) {
-    const cleaned = normalizeMarkdownText(turn.contentMarkdown);
-    if (!cleaned) {
-      continue;
-    }
-
-    const key = `${turn.role}:${normalizeForDedupe(cleaned)}`;
-    const existingIndex = indexByKey.get(key);
-    if (typeof existingIndex === "number") {
-      const previous = out[existingIndex];
-      if (!previous) {
-        continue;
-      }
-      out[existingIndex] = {
-        ...previous,
-        contentMarkdown: previous.contentMarkdown || cleaned,
-        thoughtMarkdown: previous.thoughtMarkdown || turn.thoughtMarkdown || null,
-        model: previous.model || turn.model || null,
-        timestamp: previous.timestamp || turn.timestamp || null,
-        attachments: mergeTurnAttachments(previous.attachments, turn.attachments)
-      };
-      continue;
-    }
-    indexByKey.set(key, out.length);
-    out.push({
-      ...turn,
-      contentMarkdown: cleaned
-    });
-  }
-
-  return out;
+  return dedupeTurnsFromCommon(turns, { mergeTurnAttachments });
 }
 
 function parseByRoleMarkers(text: string): CaptureTurn[] {
-  const normalized = normalizeMarkdownText(text);
-  if (!normalized) {
-    return [];
-  }
-
-  const rolePattern = /(?:^|\n)(User|You|Assistant|Model|用户|我|AI)\s*[:：]?\s*(?=\n|$)/gi;
-  const matches = Array.from(normalized.matchAll(rolePattern));
-  if (matches.length < 2) {
-    return [];
-  }
-
-  const turns: CaptureTurn[] = [];
-  for (let i = 0; i < matches.length; i += 1) {
-    const current = matches[i]!;
-    const start = (current.index || 0) + current[0].length;
-    const end = i + 1 < matches.length ? matches[i + 1]!.index || normalized.length : normalized.length;
-
-    const roleName = current[1].toLowerCase();
-    const role: CaptureTurn["role"] = roleName === "assistant" || roleName === "model" || roleName === "ai" ? "assistant" : "user";
-    const contentMarkdown = normalizeMarkdownText(normalized.slice(start, end));
-    if (!contentMarkdown || contentMarkdown.length < 2) {
-      continue;
-    }
-    turns.push({ role, contentMarkdown });
-  }
-
-  return turns;
+  return parseByRoleMarkersFromCommon(text);
 }
 
 function canonicalizePageUrl(url: string): string {
@@ -4475,62 +3649,6 @@ function attachmentDisplayName(attachment: CaptureAttachment): string {
   return raw.slice(0, 64);
 }
 
-function keepAsLinkOnlyBySource(source: CaptureSource, attachment: CaptureAttachment): boolean {
-  const url = attachment.originalUrl.trim();
-  if (!url) {
-    return true;
-  }
-  if (source === "gemini" || source === "ai_studio") {
-    if (looksLikeCloudDriveFileUrl(url)) {
-      return true;
-    }
-    if (/googleapis\.com\/drive\/v3\/files\//i.test(url)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function shouldRequireAttachmentDownload(source: CaptureSource, turn: CaptureTurn, attachment: CaptureAttachment): boolean {
-  if (turn.role !== "user" && turn.role !== "assistant") {
-    return false;
-  }
-
-  const url = attachment.originalUrl.trim();
-  const lower = url.toLowerCase();
-  if (!url || isDataUrl(url)) {
-    return false;
-  }
-  if (keepAsLinkOnlyBySource(source, attachment)) {
-    return false;
-  }
-
-  if (isVirtualAttachmentUrl(url)) {
-    return false;
-  }
-
-  if (lower.includes("oaiusercontent.com") && !isLikelyOaiAttachmentUrl(lower)) {
-    return false;
-  }
-
-  const hasDownloadableSignal =
-    looksLikeFileUrl(url) ||
-    looksLikeImageUrl(url) ||
-    looksLikePdfUrl(url) ||
-    lower.includes("/backend-api/files/") ||
-    lower.includes("googleusercontent.com/gg/");
-
-  if (!hasDownloadableSignal) {
-    return false;
-  }
-
-  if (attachment.kind === "image" || attachment.kind === "pdf" || attachment.kind === "file") {
-    return true;
-  }
-
-  return hasDownloadableSignal;
-}
-
 function detectUnresolvedUserUploadFromText(turn: CaptureTurn, attachments: CaptureAttachment[]): string[] {
   if (turn.role !== "user") {
     return [];
@@ -4760,24 +3878,11 @@ async function logAttachmentProbeOnFailure(
   console.groupEnd();
 }
 
-export interface AttachmentMaterializeProgress {
-  phase: "files";
-  processed: number;
-  total: number;
-  failed: number;
-}
-
-interface MaterializeAttachmentOptions {
-  continueOnFailure?: boolean;
-  onProgress?: (progress: AttachmentMaterializeProgress) => void;
-}
-
 export function countMaterializableAttachments(turns: CaptureTurn[]): number {
-  return turns.reduce((sum, turn) => {
-    const stripped = stripVirtualPlaceholdersWhenRealAttachmentExists(turn.attachments ?? []);
-    const deduped = mergeTurnAttachments([], stripped) ?? [];
-    return sum + deduped.length;
-  }, 0);
+  return countMaterializableAttachmentsWith(turns, {
+    stripVirtualPlaceholdersWhenRealAttachmentExists,
+    mergeTurnAttachments
+  });
 }
 
 export async function materializeAttachmentsOrThrow(
@@ -4785,138 +3890,18 @@ export async function materializeAttachmentsOrThrow(
   turns: CaptureTurn[],
   options: MaterializeAttachmentOptions = {}
 ): Promise<CaptureTurn[]> {
-  if (!turns.length) {
-    return turns;
-  }
-
-  const output: CaptureTurn[] = [];
-  const failures: string[] = [];
-  let probeLogged = false;
-  const enableProbe = !options.continueOnFailure;
-  const turnAttachmentWork = turns.map((turn) => {
-    const stripped = stripVirtualPlaceholdersWhenRealAttachmentExists(turn.attachments ?? []);
-    return mergeTurnAttachments([], stripped) ?? [];
+  return materializeAttachmentsOrThrowWith(source, turns, options, {
+    isDataUrl,
+    isVirtualAttachmentUrl,
+    attachmentDisplayName,
+    stripVirtualPlaceholdersWhenRealAttachmentExists,
+    stripRedundantFailedAttachments,
+    detectUnresolvedUserUploadFromText,
+    mergeTurnAttachments,
+    dedupeTurns,
+    maybeInlineProtectedAttachment,
+    logAttachmentProbeOnFailure
   });
-  const allAttachments = turnAttachmentWork.reduce((sum, items) => sum + items.length, 0);
-  let processedAttachments = 0;
-  let failedAttachments = 0;
-  options.onProgress?.({
-    phase: "files",
-    processed: 0,
-    total: allAttachments,
-    failed: 0
-  });
-
-  for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
-    const turn = turns[turnIndex]!;
-    const attachments = turnAttachmentWork[turnIndex] ?? [];
-
-    if (!attachments.length) {
-      output.push(turn);
-      continue;
-    }
-
-    const normalized: CaptureAttachment[] = [];
-    const pendingFailureReasonByUrl = new Map<string, string>();
-    for (const attachment of attachments) {
-      const required = shouldRequireAttachmentDownload(source, turn, attachment);
-      const inlined = await maybeInlineProtectedAttachment(attachment, required);
-      let finalized = inlined;
-      if (isDataUrl(inlined.originalUrl)) {
-        finalized = {
-          ...inlined,
-          status: "cached"
-        };
-      }
-
-      if (required && !isDataUrl(inlined.originalUrl)) {
-        const reason = isVirtualAttachmentUrl(attachment.originalUrl)
-          ? "仅提取到文件名，未拿到真实文件链接"
-          : "插件下载失败";
-        finalized = {
-          ...inlined,
-          status: "failed"
-        };
-        pendingFailureReasonByUrl.set(finalized.originalUrl.trim(), reason);
-      }
-      normalized.push(finalized);
-      processedAttachments += 1;
-    }
-
-    const deduped = mergeTurnAttachments([], normalized) ?? [];
-    const cleaned = stripRedundantFailedAttachments(deduped);
-    const cleanedWithoutVirtual = stripVirtualPlaceholdersWhenRealAttachmentExists(cleaned);
-    const normalizedForOutput = cleanedWithoutVirtual.map((attachment) => {
-      if (isVirtualAttachmentUrl(attachment.originalUrl)) {
-        pendingFailureReasonByUrl.set(
-          attachment.originalUrl.trim(),
-          "仅提取到文件名，未拿到真实文件链接"
-        );
-        return {
-          ...attachment,
-          status: "failed" as const
-        };
-      }
-      return attachment;
-    });
-    const retainedFailed = normalizedForOutput.filter((attachment) => attachment.status === "failed");
-    for (const failed of retainedFailed) {
-      const reason = pendingFailureReasonByUrl.get(failed.originalUrl.trim()) || "插件下载失败";
-      failures.push(`${attachmentDisplayName(failed)}（${reason}）`);
-      failedAttachments += 1;
-    }
-    options.onProgress?.({
-      phase: "files",
-      processed: processedAttachments,
-      total: allAttachments,
-      failed: failedAttachments
-    });
-
-    output.push({
-      ...turn,
-      attachments: mergeTurnAttachments([], normalizedForOutput)
-    });
-
-    if (source === "chatgpt" || source === "ai_studio") {
-      const unresolved = detectUnresolvedUserUploadFromText(turn, normalizedForOutput);
-      if (unresolved.length > 0) {
-        for (const name of unresolved) {
-          failures.push(`${name}（仅识别到文件名，未抓到可下载链接）`);
-        }
-        if (enableProbe && !probeLogged) {
-          probeLogged = true;
-          await logAttachmentProbeOnFailure(source, turn, cleaned, unresolved, "unresolved_name");
-        }
-      }
-    }
-
-    if (enableProbe && retainedFailed.length > 0 && !probeLogged) {
-      probeLogged = true;
-      await logAttachmentProbeOnFailure(
-        source,
-        turn,
-        retainedFailed,
-        retainedFailed.map((attachment) => attachmentDisplayName(attachment)),
-        "download_failed"
-      );
-    }
-  }
-
-  if (failures.length > 0) {
-    if (options.continueOnFailure) {
-      console.warn("[AI_HISTORY] attachment materialization has failures but continues", {
-        source,
-        failed: failures.length,
-        sample: failures.slice(0, 3)
-      });
-      return dedupeTurns(output);
-    }
-    const preview = failures.slice(0, 3).join("；");
-    const more = failures.length > 3 ? `；另有 ${failures.length - 3} 个失败` : "";
-    throw new Error(`附件下载失败：${preview}${more}`);
-  }
-
-  return dedupeTurns(output);
 }
 
 export async function enrichChatGptTurnsWithApiAttachments(

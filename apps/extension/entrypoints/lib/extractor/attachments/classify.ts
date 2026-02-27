@@ -45,7 +45,7 @@ function extractUrlExtension(url: string): string {
   return clean.split(".").pop()?.toLowerCase() ?? "";
 }
 
-function looksLikeCloudDriveFileUrl(url: string): boolean {
+export function looksLikeCloudDriveFileUrl(url: string): boolean {
   const lower = url.toLowerCase();
   return (
     lower.includes("drive.google.com/file/") ||

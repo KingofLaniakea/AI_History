@@ -16,6 +16,7 @@
 - `apps/desktop`：桌面应用前端
 - `apps/desktop/src-tauri`：桌面应用 Rust 后端（SQLite、HTTP Bridge）
 - `apps/extension`：Chrome/Edge 插件（WXT）
+- `docs/extension-architecture-baseline.md`：插件解耦架构基线与后续接入约束
 - `packages/core-types`：共享类型
 - `packages/parsers`：导入解析器（JSON/Markdown/HTML）
 - `packages/ui`：共享 UI 组件
