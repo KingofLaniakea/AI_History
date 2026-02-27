@@ -1,46 +1,13 @@
 import type { LiveCaptureRequest, NormalizedConversation } from "@ai-history/core-types";
-
-const GEMINI_BOILERPLATE_MARKERS = [
-  "如果你想让我保存或删除我们对话中关于你的信息",
-  "你需要先开启过往对话记录",
-  "你也可以手动添加或更新你给gemini的指令",
-  "从而定制gemini的回复",
-  "ifyouwantmetosaveordeleteinformationfromourconversations",
-  "youneedtoturnonchathistory",
-  "youcanalsomanuallyaddorupdateyourinstructionsforgemini"
-];
-
-function normalizeForGeminiFilter(text: string): string {
-  return text.replace(/\s+/g, "").toLowerCase();
-}
-
-function stripGeminiBoilerplate(text: string): string {
-  const paragraphs = text.split(/\n{2,}/);
-  const kept = paragraphs.filter((paragraph) => {
-    const normalized = normalizeForGeminiFilter(paragraph);
-    if (!normalized) {
-      return false;
-    }
-    return !GEMINI_BOILERPLATE_MARKERS.some((marker) => normalized.includes(marker));
-  });
-  return kept.join("\n\n").trim();
-}
-
-function stripGeminiUiPrefixes(text: string): string {
-  return text
-    .replace(/^you said\s*/i, "")
-    .replace(/^gemini said\s*/i, "")
-    .replace(/^显示思路\s*id_?\s*/i, "")
-    .trim();
-}
+import { normalizeGeminiCapturedText } from "../common/gemini-text";
 
 export function liveCaptureToConversation(request: LiveCaptureRequest): NormalizedConversation {
   const turns = request.turns
     .map((turn) => {
-      const base =
-        request.source === "gemini" ? stripGeminiUiPrefixes(turn.contentMarkdown) : turn.contentMarkdown.trim();
       let contentMarkdown =
-        request.source === "gemini" && turn.role === "assistant" ? stripGeminiBoilerplate(base) : base.trim();
+        request.source === "gemini"
+          ? normalizeGeminiCapturedText(turn.contentMarkdown, turn.role)
+          : turn.contentMarkdown.trim();
       const hasAttachments = Boolean(turn.attachments && turn.attachments.length > 0);
       if (!contentMarkdown && hasAttachments) {
         contentMarkdown = "（仅附件消息）";

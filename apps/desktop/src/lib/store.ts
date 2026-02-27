@@ -5,7 +5,7 @@ interface AppState {
   selectedConversationId: string | null;
   draggingConversationId: string | null;
   dragPointer: { x: number; y: number } | null;
-  sourceFilter: "all" | "chatgpt" | "gemini" | "ai_studio";
+  sourceFilter: "all" | "chatgpt" | "gemini" | "ai_studio" | "claude";
   searchQuery: string;
   setSelectedFolderId: (id: string | null) => void;
   setSelectedConversationId: (id: string | null) => void;

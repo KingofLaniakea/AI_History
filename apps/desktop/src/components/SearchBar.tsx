@@ -4,7 +4,7 @@ import { useExportBackup } from "../hooks/useData";
 interface SearchBarProps {
   value: string;
   onChange: (value: string) => void;
-  source: "all" | "chatgpt" | "gemini" | "ai_studio";
+  source: "all" | "chatgpt" | "gemini" | "ai_studio" | "claude";
   onSourceChange: (source: SearchBarProps["source"]) => void;
 }
 
@@ -35,6 +35,7 @@ export function SearchBar({ value, onChange, source, onSourceChange }: SearchBar
         <option value="chatgpt">ChatGPT</option>
         <option value="gemini">Gemini</option>
         <option value="ai_studio">AI Studio</option>
+        <option value="claude">Claude</option>
       </select>
     </div>
   );

@@ -1,4 +1,4 @@
-export type SourcePlatform = "chatgpt" | "gemini" | "ai_studio";
+export type SourcePlatform = "chatgpt" | "gemini" | "ai_studio" | "claude";
 
 export type Role = "user" | "assistant" | "system" | "tool";
 export type AttachmentKind = "image" | "pdf" | "file";

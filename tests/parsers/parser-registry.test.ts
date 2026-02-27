@@ -94,6 +94,56 @@ describe("parser registry", () => {
     expect(result[0]?.turns.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("keeps gemini parser and live-capture normalization aligned", async () => {
+    const sharedText =
+      "显示思路 id_\n如果你想让我保存或删除我们对话中关于你的信息，你需要先开启过往对话记录。\n\n这是一条有效回复。";
+
+    const parsed = await parseImportPayload({
+      filename: "gemini_takeout.json",
+      mime: "application/json",
+      text: JSON.stringify({
+        id: "gemini-conv-shared",
+        messages: [{ role: "assistant", text: sharedText }]
+      })
+    });
+    const parserTurnText = parsed[0]?.turns[0]?.contentMarkdown;
+
+    const live = liveCaptureToConversation({
+      source: "gemini",
+      pageUrl: "https://gemini.google.com/app/shared",
+      title: "Gemini Shared Normalize",
+      capturedAt: "2026-02-12T00:00:00Z",
+      version: "1.2.0",
+      turns: [{ role: "assistant", contentMarkdown: sharedText }]
+    });
+    const liveTurnText = live.turns[0]?.contentMarkdown;
+
+    expect(parserTurnText).toBe("这是一条有效回复。");
+    expect(liveTurnText).toBe(parserTurnText);
+  });
+
+  it("detects ai studio source from html content and parses role turns", async () => {
+    const html = `
+      <html>
+        <body>
+          <a href="https://aistudio.google.com/">Google AI Studio</a>
+          <div data-message-author-role="user">请解释函数式编程</div>
+          <div data-message-author-role="assistant">函数式编程强调不可变数据和纯函数。</div>
+        </body>
+      </html>
+    `;
+
+    const result = await parseImportPayload({
+      filename: "conversation.html",
+      mime: "text/html",
+      text: html
+    });
+
+    expect(result.length).toBe(1);
+    expect(result[0]?.source).toBe("ai_studio");
+    expect(result[0]?.turns.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("sanitizes gemini live capture ui prefixes and attachment-only turns", () => {
     const conversation = liveCaptureToConversation({
       source: "gemini",
@@ -130,5 +180,23 @@ describe("parser registry", () => {
       "（仅附件消息）"
     ]);
     expect(conversation.turns.every((turn) => turn.thoughtMarkdown === null)).toBe(true);
+  });
+
+  it("supports claude live capture source", () => {
+    const conversation = liveCaptureToConversation({
+      source: "claude",
+      pageUrl: "https://claude.ai/chat/abc",
+      title: "Claude Live",
+      capturedAt: "2026-02-27T00:00:00Z",
+      version: "1.2.0",
+      turns: [
+        { role: "user", contentMarkdown: "给我一个 TypeScript 示例" },
+        { role: "assistant", contentMarkdown: "当然，下面是一个示例。" }
+      ]
+    });
+
+    expect(conversation.source).toBe("claude");
+    expect(conversation.turns.length).toBe(2);
+    expect(conversation.turns[0]?.contentMarkdown).toBe("给我一个 TypeScript 示例");
   });
 });

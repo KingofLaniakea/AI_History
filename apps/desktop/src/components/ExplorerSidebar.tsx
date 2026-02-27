@@ -13,7 +13,7 @@ interface ExplorerSidebarProps {
   selectedFolderId: string | null;
   selectedConversationId: string | null;
   searchQuery: string;
-  sourceFilter: "all" | "chatgpt" | "gemini" | "ai_studio";
+  sourceFilter: "all" | "chatgpt" | "gemini" | "ai_studio" | "claude";
   onSelectFolder: (folderId: string | null) => void;
   onOpenConversation: (id: string) => void;
   onDropConversation: (conversationId: string, folderId: string) => void;
@@ -509,6 +509,7 @@ export function ExplorerSidebar({
             <option value="chatgpt">ChatGPT</option>
             <option value="gemini">Gemini</option>
             <option value="ai_studio">AI Studio</option>
+            <option value="claude">Claude</option>
           </select>
         </div>
       </div>

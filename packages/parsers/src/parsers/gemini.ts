@@ -1,41 +1,8 @@
 import type { NormalizedConversation, NormalizedTurn } from "@ai-history/core-types";
+import { buildImportedConversation } from "../common/conversation-builders";
+import { normalizeGeminiCapturedText } from "../common/gemini-text";
 import type { ImportPayload, Parser } from "../contracts";
 import { nonEmpty, normalizeRole, parseJsonSafe, toIsoString, toText } from "../utils";
-
-const GEMINI_BOILERPLATE_MARKERS = [
-  "如果你想让我保存或删除我们对话中关于你的信息",
-  "你需要先开启过往对话记录",
-  "你也可以手动添加或更新你给gemini的指令",
-  "从而定制gemini的回复",
-  "ifyouwantmetosaveordeleteinformationfromourconversations",
-  "youneedtoturnonchathistory",
-  "youcanalsomanuallyaddorupdateyourinstructionsforgemini"
-];
-
-function normalizeForGeminiFilter(text: string): string {
-  return text.replace(/\s+/g, "").toLowerCase();
-}
-
-function stripGeminiBoilerplate(text: string): string {
-  const paragraphs = text.split(/\n{2,}/);
-  const kept = paragraphs.filter((paragraph) => {
-    const normalized = normalizeForGeminiFilter(paragraph);
-    if (!normalized) {
-      return false;
-    }
-    return !GEMINI_BOILERPLATE_MARKERS.some((marker) => normalized.includes(marker));
-  });
-
-  return kept.join("\n\n").trim();
-}
-
-function stripGeminiUiPrefixes(text: string): string {
-  return text
-    .replace(/^you said\s*/i, "")
-    .replace(/^gemini said\s*/i, "")
-    .replace(/^显示思路\s*id_?\s*/i, "")
-    .trim();
-}
 
 function extractTurns(messageLike: unknown): NormalizedTurn[] {
   if (!Array.isArray(messageLike)) {
@@ -47,8 +14,7 @@ function extractTurns(messageLike: unknown): NormalizedTurn[] {
       const row = m as Record<string, unknown>;
       const role = normalizeRole(row.role ?? row.author ?? row.sender ?? row.type);
       const text = toText(row.text ?? row.content ?? row.parts ?? row.candidates ?? row.message);
-      const base = stripGeminiUiPrefixes(text);
-      const contentMarkdown = role === "assistant" ? stripGeminiBoilerplate(base) : base;
+      const contentMarkdown = normalizeGeminiCapturedText(text, role);
       if (!contentMarkdown) {
         return null;
       }
@@ -73,17 +39,15 @@ function parseConversationLike(item: Record<string, unknown>, filename: string):
     return null;
   }
 
-  return {
+  return buildImportedConversation({
     source: "gemini",
     sourceConversationId: String(item.id ?? item.uuid ?? item.conversationId ?? "") || null,
     title: String(item.title ?? item.name ?? item.subject ?? "Untitled Gemini Conversation"),
     createdAt: toIsoString(item.createdAt ?? item.create_time),
     updatedAt: toIsoString(item.updatedAt ?? item.update_time),
     turns,
-    meta: {
-      importedFrom: filename
-    }
-  };
+    importedFrom: filename
+  });
 }
 
 export const geminiParser: Parser = {

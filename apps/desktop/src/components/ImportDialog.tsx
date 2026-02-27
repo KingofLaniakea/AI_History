@@ -109,6 +109,7 @@ export function ImportDialog({ folderId: _folderId, mode = "panel" }: ImportDial
             <option value="chatgpt">ChatGPT</option>
             <option value="gemini">Gemini</option>
             <option value="ai_studio">AI Studio</option>
+            <option value="claude">Claude</option>
           </select>
         </label>
         <label>

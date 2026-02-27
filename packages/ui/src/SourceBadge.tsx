@@ -4,7 +4,8 @@ import type { SourcePlatform } from "@ai-history/core-types";
 const LABELS: Record<SourcePlatform, string> = {
   chatgpt: "ChatGPT",
   gemini: "Gemini",
-  ai_studio: "AI Studio"
+  ai_studio: "AI Studio",
+  claude: "Claude"
 };
 
 export function SourceBadge({ source }: { source: SourcePlatform }) {

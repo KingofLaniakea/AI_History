@@ -1,4 +1,5 @@
 import type { NormalizedConversation, NormalizedTurn } from "@ai-history/core-types";
+import { buildImportedConversation } from "../common/conversation-builders";
 import type { ImportPayload, Parser } from "../contracts";
 import { nonEmpty, normalizeRole, parseJsonSafe, toIsoString, toText } from "../utils";
 
@@ -74,17 +75,15 @@ export const chatGptParser: Parser = {
           return null;
         }
 
-        return {
+        return buildImportedConversation({
           source: "chatgpt",
           sourceConversationId: conv.id ?? null,
           title: conv.title?.trim() || "Untitled ChatGPT Conversation",
           createdAt: toIsoString(conv.create_time),
           updatedAt: toIsoString(conv.update_time),
           turns,
-          meta: {
-            importedFrom: payload.filename
-          }
-        } satisfies NormalizedConversation;
+          importedFrom: payload.filename
+        });
       })
       .filter(nonEmpty);
   }

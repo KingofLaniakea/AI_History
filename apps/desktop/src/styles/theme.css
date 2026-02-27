@@ -23,6 +23,7 @@
   --chatgpt: #10a37f;
   --gemini: #8e24aa;
   --aistudio: #4285f4;
+  --claude: #c66a0a;
   --radius-sm: 8px;
   --radius-md: 12px;
   --radius-lg: 16px;
@@ -909,6 +910,12 @@ select:focus {
   color: var(--aistudio);
   background: rgba(59, 130, 246, 0.08);
   border-color: rgba(59, 130, 246, 0.2);
+}
+
+.source-claude {
+  color: var(--claude);
+  background: rgba(198, 106, 10, 0.1);
+  border-color: rgba(198, 106, 10, 0.28);
 }
 
 /* ── Conversation View ── */

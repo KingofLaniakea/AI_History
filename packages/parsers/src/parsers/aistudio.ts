@@ -1,4 +1,5 @@
 import type { NormalizedConversation, NormalizedTurn } from "@ai-history/core-types";
+import { buildImportedConversation } from "../common/conversation-builders";
 import type { ImportPayload, Parser } from "../contracts";
 import { nonEmpty, normalizeRole, parseJsonSafe, toIsoString, toText } from "../utils";
 
@@ -33,17 +34,15 @@ function toConversation(item: Record<string, unknown>, filename: string): Normal
     return null;
   }
 
-  return {
+  return buildImportedConversation({
     source: "ai_studio",
     sourceConversationId: String(item.id ?? item.uuid ?? item.conversationId ?? "") || null,
     title: String(item.title ?? item.name ?? "Untitled AI Studio Conversation"),
     createdAt: toIsoString(item.createdAt ?? item.create_time),
     updatedAt: toIsoString(item.updatedAt ?? item.update_time),
     turns,
-    meta: {
-      importedFrom: filename
-    }
-  };
+    importedFrom: filename
+  });
 }
 
 export const aiStudioParser: Parser = {
